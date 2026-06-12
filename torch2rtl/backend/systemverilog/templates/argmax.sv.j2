@@ -1,0 +1,33 @@
+module argmax #(
+    parameter int FEATURES = {{ class_count }},
+    parameter int DATA_BITS = {{ data_bits }},
+    parameter int CLASS_BITS = {{ class_bits }}
+) (
+    input  logic signed [FEATURES*DATA_BITS-1:0] in_data,
+    output logic [CLASS_BITS-1:0] class_id
+);
+    integer idx;
+    logic signed [DATA_BITS-1:0] best_value;
+    logic signed [DATA_BITS-1:0] candidate;
+
+    function automatic logic signed [DATA_BITS-1:0] input_at(
+        input logic signed [FEATURES*DATA_BITS-1:0] values,
+        input integer index
+    );
+        begin
+            input_at = values[index*DATA_BITS +: DATA_BITS];
+        end
+    endfunction
+
+    always_comb begin
+        best_value = input_at(in_data, 0);
+        class_id = '0;
+        for (idx = 1; idx < FEATURES; idx = idx + 1) begin
+            candidate = input_at(in_data, idx);
+            if (candidate > best_value) begin
+                best_value = candidate;
+                class_id = idx[CLASS_BITS-1:0];
+            end
+        end
+    end
+endmodule

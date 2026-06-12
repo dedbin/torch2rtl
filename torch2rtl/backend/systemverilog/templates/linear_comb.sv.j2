@@ -1,0 +1,81 @@
+module linear_comb #(
+    parameter int IN_FEATURES = 1,
+    parameter int OUT_FEATURES = 1,
+    parameter int DATA_BITS = {{ data_bits }},
+    parameter int FRAC_BITS = {{ frac_bits }},
+    parameter int ACC_BITS = {{ acc_bits }}
+) (
+    input  logic signed [IN_FEATURES*DATA_BITS-1:0] in_data,
+    input  logic signed [OUT_FEATURES*IN_FEATURES*DATA_BITS-1:0] weights,
+    input  logic signed [OUT_FEATURES*DATA_BITS-1:0] biases,
+    output logic signed [OUT_FEATURES*DATA_BITS-1:0] out_data
+);
+    integer out_idx;
+    integer in_idx;
+    logic signed [ACC_BITS-1:0] acc;
+
+    function automatic logic signed [DATA_BITS-1:0] sat_q(
+        input logic signed [ACC_BITS-1:0] value
+    );
+        localparam logic signed [ACC_BITS-1:0] MAX_Q = (1 <<< (DATA_BITS - 1)) - 1;
+        localparam logic signed [ACC_BITS-1:0] MIN_Q = -(1 <<< (DATA_BITS - 1));
+        begin
+            if (value > MAX_Q) begin
+                sat_q = MAX_Q[DATA_BITS-1:0];
+            end else if (value < MIN_Q) begin
+                sat_q = MIN_Q[DATA_BITS-1:0];
+            end else begin
+                sat_q = value[DATA_BITS-1:0];
+            end
+        end
+    endfunction
+
+    function automatic logic signed [ACC_BITS-1:0] extend_q(
+        input logic signed [DATA_BITS-1:0] value
+    );
+        begin
+{% raw %}
+            extend_q = {{(ACC_BITS-DATA_BITS){value[DATA_BITS-1]}}, value};
+{% endraw %}
+        end
+    endfunction
+
+    function automatic logic signed [DATA_BITS-1:0] input_at(
+        input logic signed [IN_FEATURES*DATA_BITS-1:0] values,
+        input integer index
+    );
+        begin
+            input_at = values[index*DATA_BITS +: DATA_BITS];
+        end
+    endfunction
+
+    function automatic logic signed [DATA_BITS-1:0] weight_at(
+        input logic signed [OUT_FEATURES*IN_FEATURES*DATA_BITS-1:0] values,
+        input integer index
+    );
+        begin
+            weight_at = values[index*DATA_BITS +: DATA_BITS];
+        end
+    endfunction
+
+    function automatic logic signed [DATA_BITS-1:0] bias_at(
+        input logic signed [OUT_FEATURES*DATA_BITS-1:0] values,
+        input integer index
+    );
+        begin
+            bias_at = values[index*DATA_BITS +: DATA_BITS];
+        end
+    endfunction
+
+    always_comb begin
+        for (out_idx = 0; out_idx < OUT_FEATURES; out_idx = out_idx + 1) begin
+            acc = extend_q(bias_at(biases, out_idx)) <<< FRAC_BITS;
+            for (in_idx = 0; in_idx < IN_FEATURES; in_idx = in_idx + 1) begin
+                acc = acc
+                    + (extend_q(input_at(in_data, in_idx))
+                    * extend_q(weight_at(weights, out_idx*IN_FEATURES + in_idx)));
+            end
+            out_data[out_idx*DATA_BITS +: DATA_BITS] = sat_q(acc >>> FRAC_BITS);
+        end
+    end
+endmodule

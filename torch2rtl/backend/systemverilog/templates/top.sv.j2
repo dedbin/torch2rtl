@@ -1,0 +1,64 @@
+module top #(
+    parameter int DATA_BITS = {{ data_bits }},
+    parameter int FRAC_BITS = {{ frac_bits }},
+    parameter int ACC_BITS = {{ acc_bits }},
+    parameter int INPUT_SIZE = {{ input_size }},
+    parameter int CLASS_COUNT = {{ class_count }},
+    parameter int CLASS_BITS = {{ class_bits }}
+) (
+    input  logic signed [INPUT_SIZE*DATA_BITS-1:0] in_data,
+    output logic [CLASS_BITS-1:0] class_id,
+    output logic signed [CLASS_COUNT*DATA_BITS-1:0] logits
+);
+{% for signal in signals %}
+    logic signed [{{ signal.out_features }}*DATA_BITS-1:0] {{ signal.output_signal }};
+{% endfor %}
+{% for layer in layers if layer.kind == "linear" %}
+    logic signed [{{ layer.out_features * layer.in_features }}*DATA_BITS-1:0] {{ layer.name | upper }}_WEIGHTS;
+    logic signed [{{ layer.out_features }}*DATA_BITS-1:0] {{ layer.name | upper }}_BIASES;
+{% endfor %}
+{% for layer in layers if layer.kind == "linear" %}
+{% for value in layer.weights_values %}
+    assign {{ layer.name | upper }}_WEIGHTS[{{ loop.index0 }}*DATA_BITS +: DATA_BITS] = {{ value }};
+{% endfor %}
+{% for value in layer.biases_values %}
+    assign {{ layer.name | upper }}_BIASES[{{ loop.index0 }}*DATA_BITS +: DATA_BITS] = {{ value }};
+{% endfor %}
+{% endfor %}
+
+{% for layer in layers %}
+{% if layer.kind == "linear" %}
+    linear_comb #(
+        .IN_FEATURES({{ layer.in_features }}),
+        .OUT_FEATURES({{ layer.out_features }}),
+        .DATA_BITS(DATA_BITS),
+        .FRAC_BITS(FRAC_BITS),
+        .ACC_BITS(ACC_BITS)
+    ) {{ layer.name }} (
+        .in_data({{ layer.input_signal }}),
+        .weights({{ layer.name | upper }}_WEIGHTS),
+        .biases({{ layer.name | upper }}_BIASES),
+        .out_data({{ layer.output_signal }})
+    );
+{% elif layer.kind == "relu" %}
+    relu #(
+        .FEATURES({{ layer.in_features }}),
+        .DATA_BITS(DATA_BITS)
+    ) {{ layer.name }} (
+        .in_data({{ layer.input_signal }}),
+        .out_data({{ layer.output_signal }})
+    );
+{% elif layer.kind == "argmax" %}
+    argmax #(
+        .FEATURES({{ layer.in_features }}),
+        .DATA_BITS(DATA_BITS),
+        .CLASS_BITS(CLASS_BITS)
+    ) {{ layer.name }} (
+        .in_data({{ layer.input_signal }}),
+        .class_id(class_id)
+    );
+{% endif %}
+{% endfor %}
+
+    assign logits = {{ logits_signal }};
+endmodule

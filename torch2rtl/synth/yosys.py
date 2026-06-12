@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import os
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from string import ascii_uppercase
+
+from torch2rtl.eda_tools import find_eda_tool
+from torch2rtl.synth.report import update_report
+
+
+@dataclass(frozen=True)
+class SynthResult:
+    ok: bool
+    status: str
+    message: str
+    stdout: str = ""
+    stderr: str = ""
+
+
+def run_yosys(build_dir: Path) -> SynthResult:
+    build_dir = build_dir.resolve()
+    if not build_dir.exists():
+        return SynthResult(False, "error", f"build directory not found: {build_dir}")
+    yosys = find_eda_tool("yosys")
+    if yosys is None:
+        result = SynthResult(
+            ok=False,
+            status="not_found",
+            message="yosys not found: install Yosys to run synthesis",
+        )
+        update_report(build_dir, "synthesis", result.__dict__)
+        return result
+
+    script = (
+        "read_verilog -sv linear_comb.sv relu.sv argmax.sv top.sv; "
+        "prep -top top; stat"
+    )
+    run_result = _run_yosys(build_dir, yosys, script)
+    log_path = build_dir / "yosys.log"
+    log_path.write_text(run_result.stdout + run_result.stderr, encoding="utf-8")
+    result = SynthResult(
+        ok=run_result.returncode == 0,
+        status="passed" if run_result.returncode == 0 else "failed",
+        message="synthesis passed" if run_result.returncode == 0 else "synthesis failed",
+        stdout=_report_stdout(run_result.stdout),
+        stderr=_tail_text(run_result.stderr),
+    )
+    update_report(build_dir, "synthesis", result.__dict__)
+    return result
+
+
+def _run_yosys(
+    build_dir: Path,
+    yosys: str,
+    script: str,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        [yosys, "-p", script],
+        cwd=build_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if os.name != "nt" or "GetShortPathName() failed" not in result.stderr:
+        return result
+    return _run_yosys_with_subst(build_dir, script, result)
+
+
+def _run_yosys_with_subst(
+    build_dir: Path,
+    script: str,
+    fallback: subprocess.CompletedProcess[str],
+) -> subprocess.CompletedProcess[str]:
+    repo_root = Path(__file__).resolve().parents[2]
+    suite_root = repo_root / "tools" / "oss-cad-suite"
+    yosys_exe = suite_root / "bin" / "yosys.exe"
+    if not yosys_exe.exists():
+        return fallback
+
+    try:
+        relative_build = build_dir.relative_to(repo_root)
+    except ValueError:
+        return fallback
+
+    drive = _free_subst_drive()
+    if drive is None:
+        return fallback
+
+    map_result = subprocess.run(
+        ["subst", drive, str(repo_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if map_result.returncode != 0:
+        return fallback
+
+    try:
+        mapped_root = Path(f"{drive}\\")
+        mapped_suite = mapped_root / "tools" / "oss-cad-suite"
+        env = _oss_cad_env(mapped_suite)
+        return subprocess.run(
+            [str(mapped_suite / "bin" / "yosys.exe"), "-p", script],
+            cwd=mapped_root / relative_build,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        subprocess.run(
+            ["subst", drive, "/D"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def _free_subst_drive() -> str | None:
+    for letter in reversed(ascii_uppercase):
+        drive = f"{letter}:"
+        if not Path(f"{drive}\\").exists():
+            return drive
+    return None
+
+
+def _oss_cad_env(suite_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    suite = str(suite_root) + "\\"
+    env["YOSYSHQ_ROOT"] = suite
+    env["SSL_CERT_FILE"] = str(suite_root / "etc" / "cacert.pem")
+    env["PATH"] = f"{suite_root / 'bin'};{suite_root / 'lib'};{env.get('PATH', '')}"
+    env["PYTHON_EXECUTABLE"] = str(suite_root / "lib" / "python3.exe")
+    env["YOSYS_DATDIR"] = str(suite_root / "share" / "yosys")
+    env["QT_PLUGIN_PATH"] = str(suite_root / "lib" / "qt5" / "plugins")
+    env["QT_LOGGING_RULES"] = "*=false"
+    env["GTK_EXE_PREFIX"] = suite
+    env["GTK_DATA_PREFIX"] = suite
+    env["GDK_PIXBUF_MODULEDIR"] = str(
+        suite_root / "lib" / "gdk-pixbuf-2.0" / "2.10.0" / "loaders"
+    )
+    env["GDK_PIXBUF_MODULE_FILE"] = str(
+        suite_root / "lib" / "gdk-pixbuf-2.0" / "2.10.0" / "loaders.cache"
+    )
+    env["OPENFPGALOADER_SOJ_DIR"] = str(suite_root / "share" / "openFPGALoader")
+    return env
+
+
+def _report_stdout(stdout: str) -> str:
+    marker = "=== design hierarchy ==="
+    index = stdout.rfind(marker)
+    if index == -1:
+        return _tail_text(stdout)
+    return _tail_text(stdout[index:])
+
+
+def _tail_text(text: str, max_chars: int = 8000) -> str:
+    if len(text) <= max_chars:
+        return text
+    return "... truncated ...\n" + text[-max_chars:]
