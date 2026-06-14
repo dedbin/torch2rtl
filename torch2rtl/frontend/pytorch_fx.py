@@ -10,7 +10,7 @@ from typing import Sequence
 import numpy as np
 
 from torch2rtl.ir.graph import GraphIR
-from torch2rtl.ir.ops import ArgmaxIR, FlattenIR, LinearIR, ReluIR
+from torch2rtl.ir.ops import ArgmaxIR, Conv2dIR, FlattenIR, LinearIR, ReluIR
 from torch2rtl.ir.tensor import TensorIR
 
 
@@ -132,6 +132,68 @@ def _parse_module_node(
         )
         return output, op
 
+    if isinstance(module, nn.Conv2d):
+        if len(current_tensor.shape) == 4:
+            raise UnsupportedOpError(
+                "Unsupported Conv2d input: batch dimension is not supported; "
+                "use unbatched (C, H, W)"
+            )
+        if len(current_tensor.shape) != 3:
+            raise UnsupportedOpError(
+                f"Unsupported Conv2d input rank: expected (C, H, W), got {current_tensor.shape}"
+            )
+        if int(module.groups) != 1:
+            raise UnsupportedOpError("Unsupported Conv2d groups: only groups=1 is supported")
+        if getattr(module, "padding_mode", "zeros") != "zeros":
+            raise UnsupportedOpError(
+                "Unsupported Conv2d padding_mode: only zero padding is supported"
+            )
+        dilation = _int_pair(module.dilation, "dilation")
+        if dilation != (1, 1):
+            raise UnsupportedOpError("Unsupported Conv2d dilation: only dilation=1 is supported")
+        padding = _int_pair(module.padding, "padding")
+        stride = _int_pair(module.stride, "stride")
+        kernel_height, kernel_width = _int_pair(module.kernel_size, "kernel_size")
+        in_channels, input_height, input_width = (int(dim) for dim in current_tensor.shape)
+        if in_channels != int(module.in_channels):
+            raise UnsupportedOpError(
+                "Unsupported Conv2d shape: "
+                f"expected {module.in_channels} input channels, got {in_channels}"
+            )
+        output_height = _conv_output_dim(input_height, kernel_height, stride[0], padding[0])
+        output_width = _conv_output_dim(input_width, kernel_width, stride[1], padding[1])
+        if output_height <= 0 or output_width <= 0:
+            raise UnsupportedOpError(
+                "Unsupported Conv2d output shape: "
+                f"got ({module.out_channels}, {output_height}, {output_width})"
+            )
+        output = TensorIR(
+            name=f"{node_name}_out",
+            shape=(int(module.out_channels), output_height, output_width),
+            dtype="float",
+        )
+        bias = None
+        if module.bias is not None:
+            bias = module.bias.detach().cpu().numpy().astype(np.float64)
+        op = Conv2dIR(
+            name=node_name,
+            input=current_tensor,
+            output=output,
+            in_channels=in_channels,
+            out_channels=int(module.out_channels),
+            input_height=input_height,
+            input_width=input_width,
+            output_height=output_height,
+            output_width=output_width,
+            kernel_height=kernel_height,
+            kernel_width=kernel_width,
+            stride=stride,
+            padding=padding,
+            weight=module.weight.detach().cpu().numpy().astype(np.float64),
+            bias=bias,
+        )
+        return output, op
+
     if isinstance(module, nn.ReLU):
         output = TensorIR(name=f"{node_name}_out", shape=current_tensor.shape, dtype="float")
         return output, ReluIR(name=node_name, input=current_tensor, output=output)
@@ -164,6 +226,22 @@ def _flatten_shape(shape: tuple[int, ...], start_dim: int, end_dim: int) -> tupl
         )
     flattened = math.prod(shape[start_dim : end_dim + 1])
     return (*shape[:start_dim], flattened, *shape[end_dim + 1 :])
+
+
+def _conv_output_dim(input_size: int, kernel_size: int, stride: int, padding: int) -> int:
+    return ((input_size + 2 * padding - kernel_size) // stride) + 1
+
+
+def _int_pair(value: object, name: str) -> tuple[int, int]:
+    if isinstance(value, str):
+        raise UnsupportedOpError(f"Unsupported Conv2d {name}: string values are not supported")
+    if isinstance(value, int):
+        return (value, value)
+    if isinstance(value, tuple) and len(value) == 2:
+        first, second = value
+        if isinstance(first, int) and isinstance(second, int):
+            return (first, second)
+    raise UnsupportedOpError(f"Unsupported Conv2d {name}: expected int or int pair")
 
 
 def _load_python_module(path: Path) -> ModuleType:

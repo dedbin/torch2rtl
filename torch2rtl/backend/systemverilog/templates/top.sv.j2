@@ -13,11 +13,11 @@ module top #(
 {% for signal in signals %}
     logic signed [{{ signal.out_features }}*DATA_BITS-1:0] {{ signal.output_signal }};
 {% endfor %}
-{% for layer in layers if layer.kind == "linear" %}
-    logic signed [{{ layer.out_features * layer.in_features }}*DATA_BITS-1:0] {{ layer.name | upper }}_WEIGHTS;
-    logic signed [{{ layer.out_features }}*DATA_BITS-1:0] {{ layer.name | upper }}_BIASES;
+{% for layer in layers if layer.weights_values %}
+    logic signed [{{ layer.weights_values | length }}*DATA_BITS-1:0] {{ layer.name | upper }}_WEIGHTS;
+    logic signed [{{ layer.biases_values | length }}*DATA_BITS-1:0] {{ layer.name | upper }}_BIASES;
 {% endfor %}
-{% for layer in layers if layer.kind == "linear" %}
+{% for layer in layers if layer.weights_values %}
 {% for value in layer.weights_values %}
     assign {{ layer.name | upper }}_WEIGHTS[{{ loop.index0 }}*DATA_BITS +: DATA_BITS] = {{ value }};
 {% endfor %}
@@ -31,6 +31,29 @@ module top #(
     linear_comb #(
         .IN_FEATURES({{ layer.in_features }}),
         .OUT_FEATURES({{ layer.out_features }}),
+        .DATA_BITS(DATA_BITS),
+        .FRAC_BITS(FRAC_BITS),
+        .ACC_BITS(ACC_BITS)
+    ) {{ layer.name }} (
+        .in_data({{ layer.input_signal }}),
+        .weights({{ layer.name | upper }}_WEIGHTS),
+        .biases({{ layer.name | upper }}_BIASES),
+        .out_data({{ layer.output_signal }})
+    );
+{% elif layer.kind == "conv2d" %}
+    conv2d_comb #(
+        .IN_CHANNELS({{ layer.input_shape[0] }}),
+        .IN_HEIGHT({{ layer.input_shape[1] }}),
+        .IN_WIDTH({{ layer.input_shape[2] }}),
+        .OUT_CHANNELS({{ layer.output_shape[0] }}),
+        .OUT_HEIGHT({{ layer.output_shape[1] }}),
+        .OUT_WIDTH({{ layer.output_shape[2] }}),
+        .KERNEL_HEIGHT({{ layer.kernel_size[0] }}),
+        .KERNEL_WIDTH({{ layer.kernel_size[1] }}),
+        .STRIDE_H({{ layer.stride[0] }}),
+        .STRIDE_W({{ layer.stride[1] }}),
+        .PAD_H({{ layer.padding[0] }}),
+        .PAD_W({{ layer.padding[1] }}),
         .DATA_BITS(DATA_BITS),
         .FRAC_BITS(FRAC_BITS),
         .ACC_BITS(ACC_BITS)

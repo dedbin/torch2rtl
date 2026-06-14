@@ -40,7 +40,7 @@ def run_simulation(build_dir: Path) -> SimulationResult:
 
 
 def _run_icarus(build_dir: Path, iverilog: str, vvp: str) -> SimulationResult:
-    sources = ["linear_comb.sv", "relu.sv", "argmax.sv", "top.sv", "tb_top.sv"]
+    sources = _source_files(build_dir)
     output = "simv"
     compile_cmd = [iverilog, "-g2012", "-o", output, *sources]
     compile_result = subprocess.run(
@@ -100,7 +100,7 @@ def _vvp_runtime_path(vvp: str) -> str:
 
 
 def _run_verilator(build_dir: Path, verilator: str) -> SimulationResult:
-    sources = ["linear_comb.sv", "relu.sv", "argmax.sv", "top.sv", "tb_top.sv"]
+    sources = _source_files(build_dir)
     cmd = [verilator, "--binary", "--timing", "-sv", *sources, "--top-module", "tb_top"]
     build_result = subprocess.run(
         cmd,
@@ -142,3 +142,9 @@ def _simulation_ok(returncode: int, stdout: str) -> bool:
     has_pass = any(line.startswith("PASS") for line in lines)
     has_fail = any(line.startswith("FAIL") for line in lines)
     return returncode == 0 and has_pass and not has_fail
+
+
+def _source_files(build_dir: Path) -> list[str]:
+    optional = ["conv2d_comb.sv"]
+    required = ["linear_comb.sv", "relu.sv", "argmax.sv", "top.sv", "tb_top.sv"]
+    return [name for name in optional if (build_dir / name).exists()] + required

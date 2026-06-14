@@ -11,8 +11,9 @@ The project is not a universal PyTorch-to-RTL converter. It intentionally suppor
 
 ## What It Supports
 
-MVP v0.1 supports:
+MVP v0.2 supports:
 
+- `torch.nn.Conv2d` for static unbatched `(C, H, W)` inputs
 - `torch.nn.Linear`
 - `torch.nn.ReLU`
 - `torch.nn.Flatten`
@@ -36,7 +37,7 @@ model = nn.Sequential(
 
 ## What It Does Not Do
 
-`torch2rtl` does not try to support arbitrary PyTorch models, dynamic control flow, tensors with unknown shapes, training graphs, GPUs, autograd, convolutions, normalization, attention, or production timing closure. The MVP backend is combinational and intended for clarity, not performance.
+`torch2rtl` does not try to support arbitrary PyTorch models, dynamic control flow, tensors with unknown shapes, batch inference, training graphs, GPUs, autograd, grouped/depthwise convolutions, convolution dilation, normalization, attention, or production timing closure. The MVP backend is combinational and intended for clarity, not performance.
 
 Unsupported FX nodes raise `UnsupportedOpError` with the operation that failed.
 
@@ -63,6 +64,7 @@ uv --cache-dir temp/uv-cache run torch2rtl compile examples/tiny_mlp/model.py \
 This creates:
 
 - `build/top.sv`
+- `build/conv2d_comb.sv`
 - `build/linear_comb.sv`
 - `build/relu.sv`
 - `build/argmax.sv`
@@ -73,6 +75,10 @@ This creates:
 - `build/report.json`
 - `build/visualization.json`
 - `build/visualization.html`
+
+`report.json` includes basic research metrics: parameter counts, MAC counts,
+activation sizes, and a fixed-point vs float GraphIR reference comparison for
+the generated vectors.
 
 Откройте `build/visualization.html`, чтобы посмотреть сгенерированную схему как
 интерактивную микросхему. Там показаны RTL-блоки, сигналы пути данных, файлы
@@ -123,6 +129,92 @@ Compile it from Python:
 uv --cache-dir temp/uv-cache run python examples/tiny_mlp/compile.py --out build
 ```
 
+## Grid Classifier Example
+
+`examples/grid_classifier` is a less trivial compile-only example for a single
+4x4 grid:
+
+```text
+Flatten(4x4) -> Linear(16, 8) -> ReLU -> Linear(8, 8)
+-> ReLU -> Linear(8, 4) -> Argmax
+```
+
+It uses deterministic handcrafted weights to score top, bottom, left, and right
+edge patterns. Compile it from Python:
+
+```bash
+uv --cache-dir temp/uv-cache run python examples/grid_classifier/compile.py --out build/grid_classifier
+```
+
+Or compile the model file directly through the CLI:
+
+```bash
+uv --cache-dir temp/uv-cache run torch2rtl compile examples/grid_classifier/model.py \
+  --input-shape 4 4 \
+  --out build/grid_classifier
+```
+
+## Tiny Conv Example
+
+`examples/tiny_conv` is a compile-only v0.2 example that exercises the Conv2d
+pipeline:
+
+```text
+Conv2d(1x3x3 -> 1x2x2) -> ReLU -> Flatten -> Linear(4, 4) -> Argmax
+```
+
+Compile it from Python:
+
+```bash
+uv --cache-dir temp/uv-cache run python examples/tiny_conv/compile.py --out build/tiny_conv
+```
+
+Or compile the model file directly through the CLI:
+
+```bash
+uv --cache-dir temp/uv-cache run torch2rtl compile examples/tiny_conv/model.py \
+  --input-shape 1 3 3 \
+  --out build/tiny_conv
+```
+
+## Image CNN Demo
+
+`examples/image_cnn` is the end-to-end image-recognition demo. It trains a small
+standard convolutional network on deterministic 4x4 synthetic images and then
+compiles the trained weights to RTL:
+
+```text
+Conv2d(1 -> 4) -> ReLU -> Flatten -> Linear(64, 4) -> Argmax
+```
+
+Train the CNN and save a checkpoint plus validation report:
+
+```bash
+uv --cache-dir temp/uv-cache run python examples/image_cnn/train.py
+```
+
+Compile the trained checkpoint to SystemVerilog and visualization artifacts:
+
+```bash
+uv --cache-dir temp/uv-cache run python examples/image_cnn/compile.py
+```
+
+Then verify and optionally synthesize the generated RTL:
+
+```bash
+uv --cache-dir temp/uv-cache run torch2rtl verify build/image_cnn/rtl
+uv --cache-dir temp/uv-cache run torch2rtl synth build/image_cnn/rtl
+```
+
+The generated demo artifacts are written under `build/image_cnn/`:
+
+- `image_cnn.pt`
+- `training_report.json`
+- `rtl/top.sv`
+- `rtl/tb_top.sv`
+- `rtl/report.json`
+- `rtl/visualization.html`
+
 ## Architecture
 
 - `frontend/pytorch_fx.py`: traces a PyTorch module with `torch.fx.symbolic_trace` and converts supported nodes to IR.
@@ -139,12 +231,15 @@ uv --cache-dir temp/uv-cache run python examples/tiny_mlp/compile.py --out build
 uv --cache-dir temp/uv-cache run pytest -q
 ```
 
-Tests cover quantization saturation, manual fixed-point arithmetic, FX parsing, generated SystemVerilog, and stable reference classes.
+Tests cover quantization saturation, manual fixed-point arithmetic, FX parsing,
+generated SystemVerilog, Conv2d lowering, examples, visualization, and stable
+reference classes.
 
 ## Roadmap
 
 - v0.1: Linear/ReLU/Flatten/Argmax
-- v0.2: Conv1d/Conv2d
+- v0.2: Conv2d vertical slice
+- v0.2.x: Conv1d
 - v0.3: sequential MAC backend
 - v0.4: ONNX frontend
 - v0.5: streaming interface / AXI-like interface
