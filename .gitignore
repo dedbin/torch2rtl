@@ -8,5 +8,6 @@ dist/
 *.egg-info/
 temp/
 examples/tiny_mlp/*.pt
+examples/image_cnn/*.pt
 tools/downloads/
 tools/oss-cad-suite/

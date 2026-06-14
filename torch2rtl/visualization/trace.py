@@ -8,11 +8,13 @@ import numpy as np
 from torch2rtl.quant.fixed_point import FixedPointConfig
 from torch2rtl.quant.reference import (
     QuantizedArgmaxIR,
+    QuantizedConv2dIR,
     QuantizedFlattenIR,
     QuantizedGraph,
     QuantizedLinearIR,
     QuantizedOp,
     QuantizedReluIR,
+    conv2d_fixed,
     linear_fixed,
 )
 
@@ -44,6 +46,15 @@ def trace_payload(
                 "weights": array_stats(op.weight),
                 "biases": array_stats(op.bias),
                 "macs": op.in_features * op.out_features,
+            }
+        elif isinstance(op, QuantizedConv2dIR):
+            logits = conv2d_fixed(logits, op, qgraph.cfg)
+            details = {
+                "weights": array_stats(op.weight),
+                "biases": array_stats(op.bias),
+                "macs": op.mac_count,
+                "kernel_size": f"{op.kernel_height}x{op.kernel_width}",
+                "output_shape": f"{op.out_channels}x{op.output_height}x{op.output_width}",
             }
         elif isinstance(op, QuantizedReluIR):
             logits = np.maximum(logits, 0).astype(np.int64)
@@ -96,6 +107,33 @@ def qgraph_from_manifest(manifest: dict[str, Any], build_dir: Path) -> Quantized
                     name=record["source_name"],
                     in_features=record["in_features"],
                     out_features=record["out_features"],
+                    weight=weight,
+                    bias=bias,
+                )
+            )
+        elif record["kind"] == "conv2d":
+            weight = np.loadtxt(build_dir / record["weight_file"], dtype=np.int64).reshape(
+                record["out_channels"],
+                record["in_channels"],
+                record["kernel_height"],
+                record["kernel_width"],
+            )
+            bias = np.loadtxt(build_dir / record["bias_file"], dtype=np.int64).reshape(
+                record["out_channels"]
+            )
+            ops.append(
+                QuantizedConv2dIR(
+                    name=record["source_name"],
+                    in_channels=record["in_channels"],
+                    out_channels=record["out_channels"],
+                    input_height=record["input_height"],
+                    input_width=record["input_width"],
+                    output_height=record["output_height"],
+                    output_width=record["output_width"],
+                    kernel_height=record["kernel_height"],
+                    kernel_width=record["kernel_width"],
+                    stride=tuple(record["stride"]),
+                    padding=tuple(record["padding"]),
                     weight=weight,
                     bias=bias,
                 )

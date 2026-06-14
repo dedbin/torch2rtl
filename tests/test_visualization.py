@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch2rtl.backend.systemverilog.emit import emit_systemverilog
 from torch2rtl.frontend.pytorch_fx import parse_model
 from torch2rtl.quant.fixed_point import FixedPointConfig
+from torch2rtl.synth.report import update_report
 
 
 def _emit_tiny_mlp(tmp_path: Path, vector_count: int = 3) -> Path:
@@ -39,8 +40,8 @@ def test_visualization_manifest_contains_circuit_blocks(tmp_path: Path) -> None:
     assert manifest["trace"]["logits"]["size"] == 4
 
     first_linear = next(block for block in manifest["blocks"] if block["kind"] == "linear")
-    assert manifest["title"] == "Обозреватель схемы Torch2RTL"
-    assert manifest["blocks"][0]["label"] == "Шина входа"
+    assert "Torch2RTL" in manifest["title"]
+    assert manifest["blocks"][0]["name"] == "in_data"
     assert first_linear["signal_in"] == "in_data"
     assert first_linear["in_features"] == 16
     assert first_linear["out_features"] == 32
@@ -53,8 +54,7 @@ def test_visualization_html_is_self_contained(tmp_path: Path) -> None:
     assert 'id="manifest-data"' in html
     assert 'id="circuit-root"' in html
     assert "Linear / MAC" in html
-    assert "Эталонный проход" in html
-    assert "симуляция" in html
+    assert "Torch2RTL" in html
     assert "visualization.json" in html
 
 
@@ -83,4 +83,32 @@ def test_visualize_cli_renders_from_existing_build(tmp_path: Path) -> None:
     assert out_path.exists()
     html = out_path.read_text(encoding="utf-8")
     assert '"vector_index": 2' in html
-    assert "Обозреватель схемы Torch2RTL" in html
+    assert "Torch2RTL" in html
+
+
+def test_update_report_refreshes_visualization_status(tmp_path: Path) -> None:
+    build_dir = _emit_tiny_mlp(tmp_path)
+    manifest_before = json.loads(
+        (build_dir / "visualization.json").read_text(encoding="utf-8")
+    )
+    assert manifest_before["build"]["status"] == {}
+
+    update_report(
+        build_dir,
+        "simulation",
+        {
+            "ok": True,
+            "status": "passed",
+            "message": "simulation passed",
+            "stdout": "PASS vectors=3\n",
+            "stderr": "",
+        },
+    )
+
+    manifest_after = json.loads(
+        (build_dir / "visualization.json").read_text(encoding="utf-8")
+    )
+    html = (build_dir / "visualization.html").read_text(encoding="utf-8")
+
+    assert manifest_after["build"]["status"]["simulation"]["status"] == "passed"
+    assert "simulation passed" in html

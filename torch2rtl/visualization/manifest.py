@@ -8,6 +8,7 @@ from typing import Any, Sequence
 from torch2rtl.ir.graph import GraphIR
 from torch2rtl.quant.reference import (
     QuantizedArgmaxIR,
+    QuantizedConv2dIR,
     QuantizedFlattenIR,
     QuantizedGraph,
     QuantizedLinearIR,
@@ -153,6 +154,39 @@ def _circuit_payload(
             previous_id = layer_id
             current_signal = output_signal
             current_size = op.out_features
+        elif isinstance(op, QuantizedConv2dIR):
+            output_signal = f"{layer_id}_out"
+            block = _main_block(
+                block_id=layer_id,
+                kind="conv2d",
+                label="Conv2d / MAC",
+                name=layer_id,
+                input_signal=current_signal,
+                output_signal=output_signal,
+                in_features=op.input_size,
+                out_features=op.output_size,
+                params={
+                    "weights": int(op.weight.size),
+                    "biases": int(op.bias.size),
+                    "macs": op.mac_count,
+                    "in_channels": op.in_channels,
+                    "out_channels": op.out_channels,
+                    "kernel_size": f"{op.kernel_height}x{op.kernel_width}",
+                    "stride": f"{op.stride[0]}x{op.stride[1]}",
+                    "padding": f"{op.padding[0]}x{op.padding[1]}",
+                    "output_shape": (
+                        f"{op.out_channels}x{op.output_height}x{op.output_width}"
+                    ),
+                },
+            )
+            blocks.append(block)
+            blocks.extend(_memory_blocks(layer_id, op))
+            connections.append(_data_connection(previous_id, layer_id, current_signal))
+            connections.extend(_memory_connections(layer_id))
+            ops.append(_op_record(block, op.name, idx, op))
+            previous_id = layer_id
+            current_signal = output_signal
+            current_size = op.output_size
         elif isinstance(op, QuantizedReluIR):
             output_signal = f"{layer_id}_out"
             block = _main_block(
@@ -249,7 +283,10 @@ def _main_block(
     }
 
 
-def _memory_blocks(layer_id: str, op: QuantizedLinearIR) -> list[dict[str, Any]]:
+def _memory_blocks(
+    layer_id: str,
+    op: QuantizedLinearIR | QuantizedConv2dIR,
+) -> list[dict[str, Any]]:
     return [
         {
             "id": f"{layer_id}_weights",
@@ -258,7 +295,7 @@ def _memory_blocks(layer_id: str, op: QuantizedLinearIR) -> list[dict[str, Any]]
             "label": "веса .mem",
             "name": f"{op.name}_weights.mem",
             "parent": layer_id,
-            "features": op.in_features * op.out_features,
+            "features": int(op.weight.size),
             "file": f"{op.name}_weights.mem",
             "stats": array_stats(op.weight),
         },
@@ -269,7 +306,7 @@ def _memory_blocks(layer_id: str, op: QuantizedLinearIR) -> list[dict[str, Any]]
             "label": "смещения .mem",
             "name": f"{op.name}_bias.mem",
             "parent": layer_id,
-            "features": op.out_features,
+            "features": int(op.bias.size),
             "file": f"{op.name}_bias.mem",
             "stats": array_stats(op.bias),
         },
@@ -304,6 +341,23 @@ def _op_record(
     if isinstance(op, QuantizedLinearIR):
         record.update(
             {
+                "weight_file": f"{source_name}_weights.mem",
+                "bias_file": f"{source_name}_bias.mem",
+            }
+        )
+    elif isinstance(op, QuantizedConv2dIR):
+        record.update(
+            {
+                "in_channels": op.in_channels,
+                "out_channels": op.out_channels,
+                "input_height": op.input_height,
+                "input_width": op.input_width,
+                "output_height": op.output_height,
+                "output_width": op.output_width,
+                "kernel_height": op.kernel_height,
+                "kernel_width": op.kernel_width,
+                "stride": list(op.stride),
+                "padding": list(op.padding),
                 "weight_file": f"{source_name}_weights.mem",
                 "bias_file": f"{source_name}_bias.mem",
             }

@@ -1,150 +1,314 @@
 # torch2rtl
 
-`torch2rtl` is a small, honest compiler flow for a narrow PyTorch subset:
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-FX%20to%20RTL-EE4C2C?logo=pytorch&logoColor=white)
+![SystemVerilog](https://img.shields.io/badge/SystemVerilog-generated-2B6CB0)
+![License](https://img.shields.io/badge/license-MIT-111827)
 
-```text
-PyTorch model -> torch.fx graph -> internal IR -> fixed-point quantization
--> SystemVerilog RTL -> testbench -> simulation verification -> optional Yosys report
+`torch2rtl` превращает маленькие PyTorch-модели в понятный fixed-point
+SystemVerilog. Не в стиле "нажали кнопку и получили магию", а честно: модель
+разбирается через `torch.fx`, переводится во внутренний IR, квантуется, затем
+генерируются RTL, testbench, проверочные векторы и визуализация схемы.
+
+```mermaid
+flowchart LR
+    A["PyTorch model"] --> B["torch.fx graph"]
+    B --> C["GraphIR"]
+    C --> D["int8 fixed-point"]
+    D --> E["SystemVerilog RTL"]
+    E --> F["testbench + vectors"]
+    F --> G["verify / synth / HTML view"]
 ```
 
-The project is not a universal PyTorch-to-RTL converter. It intentionally supports only a tiny set of operations so the generated RTL, fixed-point reference, and verification artifacts can be inspected and trusted.
+Если коротко: пишете небольшую нейросеть на PyTorch, запускаете компиляцию и
+получаете папку с `top.sv`, модулями слоев, тестбенчем, `.mem`-файлами,
+`report.json` и интерактивной HTML-схемой.
 
-## What It Supports
+## Зачем это нужно
 
-MVP v0.1 supports:
+- Быстро показать путь от PyTorch до RTL без тяжелой инфраструктуры.
+- Пощупать fixed-point квантизацию на простых моделях.
+- Получить читаемый SystemVerilog, который можно открыть и понять глазами.
+- Проверить RTL через Icarus Verilog или Verilator, если они установлены.
+- Получить базовый synthesis/stat report через Yosys, если он установлен.
 
-- `torch.nn.Linear`
-- `torch.nn.ReLU`
-- `torch.nn.Flatten`
-- final `argmax`
-- signed fixed-point int8 quantization by default
-- combinational SystemVerilog modules
-- Python fixed-point reference inference
-- optional Icarus Verilog, Verilator, and Yosys integration when installed
+Это учебно-исследовательский компиляторный flow, а не промышленный HLS-комбайн.
+Сила проекта в том, что все артефакты маленькие, прозрачные и проверяемые.
 
-The first supported model shape is:
+## Что уже умеет
+
+Поддерживается MVP `v0.2`:
+
+| Возможность | Статус |
+| --- | --- |
+| `torch.nn.Linear` | есть |
+| `torch.nn.ReLU` | есть |
+| `torch.nn.Flatten` | есть |
+| `torch.nn.Conv2d` для статического unbatched входа `(C, H, W)` | есть |
+| финальный `argmax` | есть |
+| signed int8 fixed-point по умолчанию | есть |
+| combinational SystemVerilog backend | есть |
+| Python fixed-point reference | есть |
+| RTL simulation через Icarus Verilog / Verilator | опционально |
+| Yosys synthesis/stat pass | опционально |
+| интерактивная HTML-визуализация схемы | есть |
+
+Пример модели, которая хорошо ложится в текущий flow:
 
 ```python
+import torch
 import torch.nn as nn
 
-model = nn.Sequential(
-    nn.Linear(16, 32),
-    nn.ReLU(),
-    nn.Linear(32, 4),
-)
+
+class TinyMLP(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 4),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 ```
 
-## What It Does Not Do
+## Честные ограничения
 
-`torch2rtl` does not try to support arbitrary PyTorch models, dynamic control flow, tensors with unknown shapes, training graphs, GPUs, autograd, convolutions, normalization, attention, or production timing closure. The MVP backend is combinational and intended for clarity, not performance.
+`torch2rtl` пока не пытается компилировать любой PyTorch-код. Сейчас вне зоны
+поддержки:
 
-Unsupported FX nodes raise `UnsupportedOpError` with the operation that failed.
+- динамический control flow;
+- неизвестные формы тензоров;
+- batch inference;
+- training graph, autograd и GPU-логика;
+- grouped/depthwise convolution, dilation;
+- normalization, attention и большие современные архитектуры;
+- production timing closure.
 
-## Install
+Если модель содержит неподдерживаемый FX-узел, проект падает явно через
+`UnsupportedOpError` и показывает, на какой операции остановился.
 
-Recommended with `uv`:
+## Установка
+
+Нужен Python `3.11+`. Самый удобный путь - через `uv`:
 
 ```bash
 uv --cache-dir temp/uv-cache sync --dev
 ```
 
-The explicit cache directory is useful on restricted Windows setups where the default `uv` cache may be outside the writable workspace.
+Почему указан `--cache-dir`: на Windows и в ограниченных окружениях стандартный
+кеш `uv` иногда лежит вне рабочей папки. Такой вариант проще воспроизводить.
 
-## Compile
+## Быстрый старт
+
+Скомпилировать готовый MLP-пример:
 
 ```bash
-uv --cache-dir temp/uv-cache run torch2rtl compile examples/tiny_mlp/model.py \
-  --input-shape 16 \
-  --bits 8 \
-  --frac-bits 6 \
-  --out build
+uv --cache-dir temp/uv-cache run torch2rtl compile examples/tiny_mlp/model.py --input-shape 16 --bits 8 --frac-bits 6 --out build
 ```
 
-This creates:
+После запуска в `build/` появятся:
 
-- `build/top.sv`
-- `build/linear_comb.sv`
-- `build/relu.sv`
-- `build/argmax.sv`
-- `build/tb_top.sv`
-- `build/input_vectors.txt`
-- `build/expected_classes.txt`
-- layer weight and bias `.mem` files
-- `build/report.json`
-- `build/visualization.json`
-- `build/visualization.html`
+```text
+top.sv
+conv2d_comb.sv
+linear_comb.sv
+relu.sv
+argmax.sv
+tb_top.sv
+input_vectors.txt
+expected_classes.txt
+*_weights.mem
+*_bias.mem
+report.json
+visualization.json
+visualization.html
+```
 
-Откройте `build/visualization.html`, чтобы посмотреть сгенерированную схему как
-интерактивную микросхему. Там показаны RTL-блоки, сигналы пути данных, файлы
-памяти с параметрами, статус инструментов и эталонный проход fixed-point
-модели для одного тестового вектора.
+Откройте `build/visualization.html`, чтобы увидеть схему как интерактивную
+микросхему: слои, сигналы, файлы памяти, статус EDA-инструментов и fixed-point
+reference для тестового вектора.
 
-Чтобы перерисовать схему после `verify` или `synth`, либо выбрать другой
-вектор:
+Перерисовать визуализацию после `verify` или `synth`:
 
 ```bash
 uv --cache-dir temp/uv-cache run torch2rtl visualize build --vector-index 0
 ```
 
-## Verify
+## Проверка RTL
 
 ```bash
 uv --cache-dir temp/uv-cache run torch2rtl verify build
 ```
 
-If `iverilog` + `vvp` are available, the command builds and runs the generated testbench. If Icarus is not available but `verilator` is present, it attempts a Verilator binary run. If no simulator is installed, it reports `simulator not found` and exits cleanly.
+Команда ищет доступный симулятор. Если есть `iverilog` + `vvp`, запускается
+сгенерированный testbench. Если Icarus Verilog нет, но есть `verilator`, будет
+попытка запуска через Verilator. Если симуляторов нет, команда аккуратно
+сообщит `simulator not found` и завершится без падения.
 
-## Synthesize
+## Synthesis report
 
 ```bash
 uv --cache-dir temp/uv-cache run torch2rtl synth build
 ```
 
-If `yosys` is installed, the command runs a simple synthesis/stat pass and writes `build/yosys.log`. If not, it reports `yosys not found`.
+Если установлен `yosys`, команда делает простой synthesis/stat pass и пишет
+`build/yosys.log`. Если `yosys` не найден, проект честно сообщает об этом.
 
-## Tiny MLP Example
+## Готовые примеры
 
-The example task classifies a 16-element vector by the block of four elements with the largest sum:
+### Tiny MLP
 
-- class 0: elements `0..3`
-- class 1: elements `4..7`
-- class 2: elements `8..11`
-- class 3: elements `12..15`
-
-Train the example model:
+Классифицирует вектор из 16 чисел: выбирает блок из 4 элементов с самой большой
+суммой.
 
 ```bash
 uv --cache-dir temp/uv-cache run python examples/tiny_mlp/train.py --epochs 30
-```
-
-Compile it from Python:
-
-```bash
 uv --cache-dir temp/uv-cache run python examples/tiny_mlp/compile.py --out build
 ```
 
-## Architecture
+### Grid Classifier
 
-- `frontend/pytorch_fx.py`: traces a PyTorch module with `torch.fx.symbolic_trace` and converts supported nodes to IR.
-- `ir/`: PyTorch-independent dataclasses for tensors, ops, and graphs.
-- `quant/fixed_point.py`: fixed-point config, quantization, dequantization, and saturation helpers.
-- `quant/reference.py`: fixed-point inference without PyTorch; this is the RTL oracle.
-- `backend/systemverilog/`: Jinja2 templates and emitter for readable combinational SystemVerilog.
-- `verify/`: random vector generation, simulator discovery, and comparison helpers.
-- `synth/`: optional Yosys integration and report update helpers.
+Compile-only пример для сетки `4x4`:
 
-## Tests
+```text
+Flatten(4x4) -> Linear(16, 8) -> ReLU -> Linear(8, 8)
+-> ReLU -> Linear(8, 4) -> Argmax
+```
+
+```bash
+uv --cache-dir temp/uv-cache run python examples/grid_classifier/compile.py --out build/grid_classifier
+```
+
+Или напрямую через CLI:
+
+```bash
+uv --cache-dir temp/uv-cache run torch2rtl compile examples/grid_classifier/model.py --input-shape 4 4 --out build/grid_classifier
+```
+
+### Tiny Conv
+
+Мини-пайплайн для проверки `Conv2d`:
+
+```text
+Conv2d(1x3x3 -> 1x2x2) -> ReLU -> Flatten -> Linear(4, 4) -> Argmax
+```
+
+```bash
+uv --cache-dir temp/uv-cache run python examples/tiny_conv/compile.py --out build/tiny_conv
+```
+
+Или через CLI:
+
+```bash
+uv --cache-dir temp/uv-cache run torch2rtl compile examples/tiny_conv/model.py --input-shape 1 3 3 --out build/tiny_conv
+```
+
+### Image CNN Demo
+
+End-to-end демо: обучает маленькую CNN на детерминированных синтетических
+изображениях `4x4`, сохраняет checkpoint и компилирует веса в RTL.
+
+```text
+Conv2d(1 -> 4) -> ReLU -> Flatten -> Linear(64, 4) -> Argmax
+```
+
+```bash
+uv --cache-dir temp/uv-cache run python examples/image_cnn/train.py
+uv --cache-dir temp/uv-cache run python examples/image_cnn/compile.py
+uv --cache-dir temp/uv-cache run torch2rtl verify build/image_cnn/rtl
+uv --cache-dir temp/uv-cache run torch2rtl synth build/image_cnn/rtl
+```
+
+Артефакты появятся в `build/image_cnn/`:
+
+- `image_cnn.pt`
+- `training_report.json`
+- `rtl/top.sv`
+- `rtl/tb_top.sv`
+- `rtl/report.json`
+- `rtl/visualization.html`
+
+## CLI-шпаргалка
+
+```bash
+# compile
+uv --cache-dir temp/uv-cache run torch2rtl compile MODEL.py --input-shape 16 --out build
+
+# verify generated RTL
+uv --cache-dir temp/uv-cache run torch2rtl verify build
+
+# run optional Yosys report
+uv --cache-dir temp/uv-cache run torch2rtl synth build
+
+# rebuild visualization
+uv --cache-dir temp/uv-cache run torch2rtl visualize build --vector-index 0
+```
+
+Полезные флаги `compile`:
+
+| Флаг | Что делает |
+| --- | --- |
+| `--input-shape` | форма входа без batch dimension |
+| `--bits` | ширина fixed-point числа, по умолчанию `8` |
+| `--frac-bits` | число дробных битов, по умолчанию `6` |
+| `--acc-bits` | ширина аккумулятора, по умолчанию `32` |
+| `--vectors` | сколько тестовых векторов сгенерировать |
+| `--seed` | seed для воспроизводимых векторов |
+| `--out` | папка для RTL и отчетов |
+
+## Архитектура проекта
+
+```text
+torch2rtl/
+  frontend/pytorch_fx.py        # PyTorch -> torch.fx -> GraphIR
+  ir/                           # dataclass-IR для tensors, ops и graph
+  quant/fixed_point.py          # fixed-point config и saturation helpers
+  quant/reference.py            # Python reference без PyTorch
+  backend/systemverilog/        # Jinja2 templates и RTL emitter
+  verify/                       # vectors, simulator discovery, compare
+  synth/                        # Yosys integration
+  visualization/                # HTML/JSON визуализация схемы
+examples/
+  tiny_mlp/
+  grid_classifier/
+  tiny_conv/
+  image_cnn/
+```
+
+Внутренний принцип простой: сначала получить маленький и понятный `GraphIR`,
+потом уже генерировать артефакты. Поэтому проект удобно читать, отлаживать и
+расширять по одному оператору.
+
+## Разработка
+
+Запустить тесты:
 
 ```bash
 uv --cache-dir temp/uv-cache run pytest -q
 ```
 
-Tests cover quantization saturation, manual fixed-point arithmetic, FX parsing, generated SystemVerilog, and stable reference classes.
+Тесты покрывают:
+
+- fixed-point saturation и ручную арифметику;
+- PyTorch FX parsing;
+- SystemVerilog generation;
+- Conv2d lowering;
+- примеры из `examples/`;
+- visualization artifacts;
+- стабильные reference classes.
 
 ## Roadmap
 
-- v0.1: Linear/ReLU/Flatten/Argmax
-- v0.2: Conv1d/Conv2d
-- v0.3: sequential MAC backend
-- v0.4: ONNX frontend
-- v0.5: streaming interface / AXI-like interface
+- `v0.1`: Linear / ReLU / Flatten / Argmax.
+- `v0.2`: Conv2d vertical slice.
+- `v0.2.x`: Conv1d.
+- `v0.3`: sequential MAC backend.
+- `v0.4`: ONNX frontend.
+- `v0.5`: streaming interface / AXI-like interface.
+
+## Лицензия
+
+MIT. Делайте крутые эксперименты, проверяйте сгенерированный RTL и не верьте
+магии без testbench.

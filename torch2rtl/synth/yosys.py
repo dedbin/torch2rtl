@@ -33,10 +33,8 @@ def run_yosys(build_dir: Path) -> SynthResult:
         update_report(build_dir, "synthesis", result.__dict__)
         return result
 
-    script = (
-        "read_verilog -sv linear_comb.sv relu.sv argmax.sv top.sv; "
-        "prep -top top; stat"
-    )
+    sources = " ".join(_source_files(build_dir))
+    script = f"read_verilog -sv {sources}; prep -top top; stat"
     run_result = _run_yosys(build_dir, yosys, script)
     log_path = build_dir / "yosys.log"
     log_path.write_text(run_result.stdout + run_result.stderr, encoding="utf-8")
@@ -160,3 +158,9 @@ def _tail_text(text: str, max_chars: int = 8000) -> str:
     if len(text) <= max_chars:
         return text
     return "... truncated ...\n" + text[-max_chars:]
+
+
+def _source_files(build_dir: Path) -> list[str]:
+    optional = ["conv2d_comb.sv"]
+    required = ["linear_comb.sv", "relu.sv", "argmax.sv", "top.sv"]
+    return [name for name in optional if (build_dir / name).exists()] + required

@@ -1,0 +1,131 @@
+module conv2d_comb #(
+    parameter int IN_CHANNELS = 1,
+    parameter int IN_HEIGHT = 1,
+    parameter int IN_WIDTH = 1,
+    parameter int OUT_CHANNELS = 1,
+    parameter int OUT_HEIGHT = 1,
+    parameter int OUT_WIDTH = 1,
+    parameter int KERNEL_HEIGHT = 1,
+    parameter int KERNEL_WIDTH = 1,
+    parameter int STRIDE_H = 1,
+    parameter int STRIDE_W = 1,
+    parameter int PAD_H = 0,
+    parameter int PAD_W = 0,
+    parameter int DATA_BITS = {{ data_bits }},
+    parameter int FRAC_BITS = {{ frac_bits }},
+    parameter int ACC_BITS = {{ acc_bits }}
+) (
+    input  logic signed [IN_CHANNELS*IN_HEIGHT*IN_WIDTH*DATA_BITS-1:0] in_data,
+    input  logic signed [OUT_CHANNELS*IN_CHANNELS*KERNEL_HEIGHT*KERNEL_WIDTH*DATA_BITS-1:0] weights,
+    input  logic signed [OUT_CHANNELS*DATA_BITS-1:0] biases,
+    output logic signed [OUT_CHANNELS*OUT_HEIGHT*OUT_WIDTH*DATA_BITS-1:0] out_data
+);
+    integer out_channel;
+    integer out_y;
+    integer out_x;
+    integer in_channel;
+    integer kernel_y;
+    integer kernel_x;
+    integer in_y;
+    integer in_x;
+    integer out_index;
+    integer input_index;
+    integer weight_index;
+    logic signed [ACC_BITS-1:0] acc;
+
+    function automatic logic signed [DATA_BITS-1:0] sat_q(
+        input logic signed [ACC_BITS-1:0] value
+    );
+        localparam logic signed [ACC_BITS-1:0] MAX_Q = (1 <<< (DATA_BITS - 1)) - 1;
+        localparam logic signed [ACC_BITS-1:0] MIN_Q = -(1 <<< (DATA_BITS - 1));
+        begin
+            if (value > MAX_Q) begin
+                sat_q = MAX_Q[DATA_BITS-1:0];
+            end else if (value < MIN_Q) begin
+                sat_q = MIN_Q[DATA_BITS-1:0];
+            end else begin
+                sat_q = value[DATA_BITS-1:0];
+            end
+        end
+    endfunction
+
+    function automatic logic signed [ACC_BITS-1:0] extend_q(
+        input logic signed [DATA_BITS-1:0] value
+    );
+        begin
+{% raw %}
+            extend_q = {{(ACC_BITS-DATA_BITS){value[DATA_BITS-1]}}, value};
+{% endraw %}
+        end
+    endfunction
+
+    function automatic logic signed [DATA_BITS-1:0] input_at(
+        input logic signed [IN_CHANNELS*IN_HEIGHT*IN_WIDTH*DATA_BITS-1:0] values,
+        input integer index
+    );
+        begin
+            input_at = values[index*DATA_BITS +: DATA_BITS];
+        end
+    endfunction
+
+    function automatic logic signed [DATA_BITS-1:0] weight_at(
+        input logic signed [OUT_CHANNELS*IN_CHANNELS*KERNEL_HEIGHT*KERNEL_WIDTH*DATA_BITS-1:0] values,
+        input integer index
+    );
+        begin
+            weight_at = values[index*DATA_BITS +: DATA_BITS];
+        end
+    endfunction
+
+    function automatic logic signed [DATA_BITS-1:0] bias_at(
+        input logic signed [OUT_CHANNELS*DATA_BITS-1:0] values,
+        input integer index
+    );
+        begin
+            bias_at = values[index*DATA_BITS +: DATA_BITS];
+        end
+    endfunction
+
+    always_comb begin
+        out_data = '0;
+        out_channel = 0;
+        out_y = 0;
+        out_x = 0;
+        in_channel = 0;
+        kernel_y = 0;
+        kernel_x = 0;
+        in_y = 0;
+        in_x = 0;
+        out_index = 0;
+        input_index = 0;
+        weight_index = 0;
+        acc = '0;
+        for (out_channel = 0; out_channel < OUT_CHANNELS; out_channel = out_channel + 1) begin
+            for (out_y = 0; out_y < OUT_HEIGHT; out_y = out_y + 1) begin
+                for (out_x = 0; out_x < OUT_WIDTH; out_x = out_x + 1) begin
+                    acc = extend_q(bias_at(biases, out_channel)) <<< FRAC_BITS;
+                    for (in_channel = 0; in_channel < IN_CHANNELS; in_channel = in_channel + 1) begin
+                        for (kernel_y = 0; kernel_y < KERNEL_HEIGHT; kernel_y = kernel_y + 1) begin
+                            in_y = out_y * STRIDE_H + kernel_y - PAD_H;
+                            if (in_y >= 0 && in_y < IN_HEIGHT) begin
+                                for (kernel_x = 0; kernel_x < KERNEL_WIDTH; kernel_x = kernel_x + 1) begin
+                                    in_x = out_x * STRIDE_W + kernel_x - PAD_W;
+                                    if (in_x >= 0 && in_x < IN_WIDTH) begin
+                                        input_index = (in_channel*IN_HEIGHT + in_y)*IN_WIDTH + in_x;
+                                        weight_index = (((out_channel*IN_CHANNELS + in_channel)
+                                            * KERNEL_HEIGHT + kernel_y) * KERNEL_WIDTH + kernel_x);
+                                        acc = acc
+                                            + (extend_q(input_at(in_data, input_index))
+                                            * extend_q(weight_at(weights, weight_index)));
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    out_index = (out_channel*OUT_HEIGHT + out_y)*OUT_WIDTH + out_x;
+                    out_data[out_index*DATA_BITS +: DATA_BITS] = sat_q(acc >>> FRAC_BITS);
+                end
+            end
+        end
+    end
+endmodule
