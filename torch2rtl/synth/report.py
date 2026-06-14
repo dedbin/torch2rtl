@@ -17,3 +17,14 @@ def update_report(build_dir: Path, section: str, payload: dict[str, Any]) -> Non
     status = report.setdefault("status", {})
     status[section] = payload
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    _refresh_visualization(build_dir)
+
+
+def _refresh_visualization(build_dir: Path) -> None:
+    manifest_path = build_dir / "visualization.json"
+    if not manifest_path.exists():
+        return
+
+    from torch2rtl.visualization.manifest import render_visualization_from_build
+
+    render_visualization_from_build(build_dir)
