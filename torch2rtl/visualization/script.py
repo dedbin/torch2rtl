@@ -295,6 +295,47 @@ function renderTrace() {
   });
 }
 
+function renderResources() {
+  const build = manifest.build || {};
+  const synthesis = build.synthesis || (build.status || {}).synthesis || {};
+  const resource = synthesis.metrics || {};
+  const model = build.metrics || {};
+  const reference = build.reference || {};
+  const rows = [
+    ["параметры модели", model.parameters],
+    ["MAC в модели", model.macs],
+    ["ячейки Yosys", resource.cells],
+    ["провода", resource.wires],
+    ["битов проводов", resource.wire_bits],
+    ["порты", resource.ports],
+    ["совпадения классов", reference.class_matches],
+    ["ошибки классов", reference.class_mismatches],
+    ["средняя ошибка логитов", reference.mean_abs_logit_error],
+    ["макс. ошибка логитов", reference.max_abs_logit_error],
+  ].filter(([, value]) => value !== undefined && value !== null);
+
+  const cellTypes = Object.entries(resource.cell_types || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6);
+  const cellRows = cellTypes.map(([name, value]) => `<dt>${h(name)}</dt><dd>${h(value)}</dd>`).join("");
+  document.getElementById("resource-status").textContent = statusMessage(synthesis.message);
+  document.getElementById("resource-summary").innerHTML = rows.length
+    ? `<dl class="kv">${rows.map(([key, value]) => `<dt>${h(key)}</dt><dd>${h(value)}</dd>`).join("")}${cellRows}</dl>`
+    : `<p class="empty-note">нет данных синтеза</p>`;
+}
+
+function renderArtifacts() {
+  const artifacts = (manifest.build || {}).artifacts || [];
+  document.getElementById("artifact-status").textContent = `${artifacts.length} файлов`;
+  document.getElementById("artifact-links").innerHTML = artifacts.length
+    ? `<div class="artifact-list">${artifacts.map((item) => `
+        <a href="${encodeURI(item.file)}">
+          <strong>${h(item.file)}</strong>
+          <span>${h(item.size_bytes)} байт</span>
+        </a>`).join("")}</div>`
+    : `<p class="empty-note">артефакты не найдены</p>`;
+}
+
 function selectBlock(id) {
   state.selectedId = id;
   renderCircuit();
@@ -305,4 +346,6 @@ renderReadouts();
 renderCircuit();
 renderInspector();
 renderTrace();
+renderResources();
+renderArtifacts();
 """

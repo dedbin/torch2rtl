@@ -372,9 +372,25 @@ def _build_payload(build_dir: Path, generated_files: Sequence[str]) -> dict[str,
         return {
             "generated_files": report.get("generated_files", list(generated_files)),
             "tools": report.get("tools", {}),
+            "environment": report.get("environment", {}),
             "status": report.get("status", {}),
+            "demo": report.get("demo", {}),
+            "metrics": report.get("metrics", {}),
+            "reference": report.get("reference", {}),
+            "simulation": report.get("simulation", {}),
+            "synthesis": report.get("synthesis", {}),
+            "artifacts": _artifact_payload(build_dir, report.get("generated_files", [])),
         }
     return {"generated_files": list(generated_files), "tools": {}, "status": {}}
+
+
+def _artifact_payload(build_dir: Path, generated_files: Sequence[str]) -> list[dict[str, Any]]:
+    names = list(dict.fromkeys([*generated_files, "yosys.log"]))
+    return [
+        {"file": name, "size_bytes": int((build_dir / name).stat().st_size)}
+        for name in names
+        if (build_dir / name).is_file()
+    ]
 
 
 def _safe_id(name: str) -> str:
