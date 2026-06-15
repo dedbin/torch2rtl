@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from string import ascii_uppercase
+from typing import Any
 
 from torch2rtl.eda_tools import find_eda_tool
 from torch2rtl.synth.report import update_report
@@ -17,6 +19,21 @@ class SynthResult:
     message: str
     stdout: str = ""
     stderr: str = ""
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
+RESOURCE_LABELS = {
+    "wires": "wires",
+    "wire bits": "wire_bits",
+    "public wires": "public_wires",
+    "public wire bits": "public_wire_bits",
+    "ports": "ports",
+    "port bits": "port_bits",
+    "memories": "memories",
+    "memory bits": "memory_bits",
+    "processes": "processes",
+    "cells": "cells",
+}
 
 
 def run_yosys(build_dir: Path) -> SynthResult:
@@ -36,17 +53,57 @@ def run_yosys(build_dir: Path) -> SynthResult:
     sources = " ".join(_source_files(build_dir))
     script = f"read_verilog -sv {sources}; prep -top top; stat"
     run_result = _run_yosys(build_dir, yosys, script)
+    full_log = run_result.stdout + run_result.stderr
     log_path = build_dir / "yosys.log"
-    log_path.write_text(run_result.stdout + run_result.stderr, encoding="utf-8")
+    log_path.write_text(full_log, encoding="utf-8")
     result = SynthResult(
         ok=run_result.returncode == 0,
         status="passed" if run_result.returncode == 0 else "failed",
         message="synthesis passed" if run_result.returncode == 0 else "synthesis failed",
         stdout=_report_stdout(run_result.stdout),
         stderr=_tail_text(run_result.stderr),
+        metrics=parse_yosys_metrics(full_log),
     )
     update_report(build_dir, "synthesis", result.__dict__)
     return result
+
+
+def parse_yosys_metrics(text: str) -> dict[str, Any]:
+    section = _last_design_hierarchy_section(text)
+    metrics: dict[str, Any] = {}
+    cell_types: dict[str, int] = {}
+
+    for line in section.splitlines():
+        stripped = line.strip()
+        match = re.fullmatch(r"(-|\d+)\s+(.+)", stripped)
+        if match is None:
+            continue
+        count = _yosys_count(match.group(1))
+        label = match.group(2).strip()
+        metric_name = RESOURCE_LABELS.get(label)
+        if metric_name is not None:
+            metrics[metric_name] = count
+            continue
+        if label.startswith("$"):
+            cell_types[label] = count
+
+    if cell_types:
+        metrics["cell_types"] = cell_types
+    return metrics
+
+
+def _last_design_hierarchy_section(text: str) -> str:
+    marker = "=== design hierarchy ==="
+    index = text.rfind(marker)
+    if index == -1:
+        return text
+    return text[index + len(marker) :]
+
+
+def _yosys_count(value: str) -> int:
+    if value == "-":
+        return 0
+    return int(value)
 
 
 def _run_yosys(

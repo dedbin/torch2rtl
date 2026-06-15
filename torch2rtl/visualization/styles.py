@@ -281,6 +281,52 @@ a:hover { text-decoration: underline; }
   gap: 12px;
 }
 
+.report-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.report-panel { min-height: 170px; }
+
+.report-head {
+  min-height: 44px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.report-head strong { font-size: 13px; text-transform: uppercase; }
+
+.report-head span, .empty-note { color: var(--muted); font-size: 12px; }
+
+.report-body { padding: 14px 16px; }
+
+.artifact-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.artifact-list a {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfa;
+}
+
+.artifact-list strong, .artifact-list span { display: block; overflow-wrap: anywhere; }
+
+.artifact-list span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .trace-summary {
   padding-right: 12px;
   border-right: 1px solid var(--line);
@@ -336,6 +382,7 @@ code {
   .quant-readout { justify-content: flex-start; }
   .status-strip { grid-template-columns: 1fr 1fr; }
   .workspace { grid-template-columns: 1fr; }
+  .report-grid { grid-template-columns: 1fr; }
   .trace-grid { grid-template-columns: 1fr; }
   .trace-summary {
     padding-right: 0;

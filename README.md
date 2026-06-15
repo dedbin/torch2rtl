@@ -102,6 +102,27 @@ uv --cache-dir temp/uv-cache sync --dev
 
 ## Быстрый старт
 
+Запустить полный board-free demo-flow:
+
+```bash
+uv --cache-dir temp/uv-cache run torch2rtl demo --name tiny-conv --out build/demo
+```
+
+Команда сама выполнит компиляцию RTL, симуляцию, Yosys synthesis/stat pass и
+обновит `build/demo/visualization.html`. Этот HTML-файл теперь является главным
+отчетом демо: в нем есть статус сборки, схема RTL-блоков, trace одного
+проверочного вектора, краткие ресурсы синтеза и ссылки на сгенерированные
+артефакты.
+
+Доступные демо:
+
+```text
+tiny-mlp
+grid-classifier
+tiny-conv
+image-cnn
+```
+
 Скомпилировать готовый MLP-пример:
 
 ```bash
@@ -233,6 +254,9 @@ uv --cache-dir temp/uv-cache run torch2rtl synth build/image_cnn/rtl
 ## CLI-шпаргалка
 
 ```bash
+# full board-free demo flow
+uv --cache-dir temp/uv-cache run torch2rtl demo --name tiny-conv --out build/demo
+
 # compile
 uv --cache-dir temp/uv-cache run torch2rtl compile MODEL.py --input-shape 16 --out build
 
@@ -303,9 +327,8 @@ uv --cache-dir temp/uv-cache run pytest -q
 
 - `v0.1`: Linear / ReLU / Flatten / Argmax.
 - `v0.2`: Conv2d vertical slice.
-- `v0.2.x`: Conv1d.
-- `v0.3`: sequential MAC backend.
-- `v0.4`: ONNX frontend.
+- `v0.3`: board-free demo flow.
+- `v0.4`: sequential MAC backend.
 - `v0.5`: streaming interface / AXI-like interface.
 
 ## Лицензия

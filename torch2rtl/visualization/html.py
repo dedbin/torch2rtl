@@ -70,6 +70,22 @@ HTML_TEMPLATE = """<!doctype html>
       </div>
       <div class="trace-grid" id="trace-grid"></div>
     </section>
+    <section class="report-grid">
+      <article class="panel report-panel">
+        <div class="report-head">
+          <strong>Ресурсы синтеза</strong>
+          <span id="resource-status"></span>
+        </div>
+        <div class="report-body" id="resource-summary"></div>
+      </article>
+      <article class="panel report-panel">
+        <div class="report-head">
+          <strong>Артефакты</strong>
+          <span id="artifact-status"></span>
+        </div>
+        <div class="report-body" id="artifact-links"></div>
+      </article>
+    </section>
   </main>
   <script>
 {script}
