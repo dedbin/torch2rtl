@@ -5,9 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from torch2rtl.cli import build_parser
-from torch2rtl.demo import get_demo_spec, run_demo
-from torch2rtl.synth.yosys import parse_yosys_metrics
+from torch2rtl.backend.systemverilog.emit import BuildReport
+from torch2rtl.cli import _format_demo_summary, build_parser
+from torch2rtl.demo import DemoResult, get_demo_spec, run_demo
+from torch2rtl.synth.yosys import SynthResult, parse_yosys_metrics
+from torch2rtl.verify.simulator import SimulationResult
 
 
 def test_demo_parser_accepts_name_flag() -> None:
@@ -32,6 +34,51 @@ def test_demo_parser_accepts_positional_name() -> None:
 def test_get_demo_spec_rejects_unknown_demo() -> None:
     with pytest.raises(ValueError, match="unknown demo"):
         get_demo_spec("missing")
+
+
+def test_format_demo_summary_lists_demo_artifacts(tmp_path: Path) -> None:
+    result = DemoResult(
+        name="tiny-conv",
+        build_report=BuildReport(
+            out_dir=tmp_path,
+            generated_files=(
+                "argmax.sv",
+                "expected_classes.txt",
+                "input_vectors.txt",
+                "report.json",
+                "tb_top.sv",
+                "top.sv",
+                "vectors.json",
+                "visualization.html",
+            ),
+            report_path=tmp_path / "report.json",
+        ),
+        simulation=SimulationResult(
+            ok=False,
+            status="not_found",
+            message="simulator not found: install Icarus Verilog or Verilator",
+        ),
+        synthesis=SynthResult(
+            ok=False,
+            status="not_found",
+            message="yosys not found: install Yosys to run synthesis",
+        ),
+        visualization_path=tmp_path / "visualization.html",
+    )
+
+    lines = _format_demo_summary(
+        result,
+        tools={"iverilog": False, "vvp": False, "verilator": False, "yosys": False},
+    )
+    text = "\n".join(lines)
+
+    assert "compile: ok (8 generated artifacts)" in text
+    assert "rtl files: argmax.sv, tb_top.sv, top.sv" in text
+    assert "test data: expected_classes.txt, input_vectors.txt, vectors.json" in text
+    assert "verification: skipped" in text
+    assert "synthesis: skipped" in text
+    assert f"html report: {tmp_path / 'visualization.html'}" in text
+    assert "optional EDA tools missing: iverilog, vvp, verilator, yosys" in text
 
 
 def test_parse_yosys_metrics_extracts_design_hierarchy() -> None:
