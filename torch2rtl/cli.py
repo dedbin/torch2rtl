@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Mapping
 
 from torch2rtl.backend.systemverilog.emit import emit_systemverilog
-from torch2rtl.demo import DEFAULT_DEMO_OUT, demo_names, run_demo
+from torch2rtl.demo import DEFAULT_DEMO_OUT, DemoResult, demo_names, run_demo
+from torch2rtl.eda_tools import detect_eda_tools
 from torch2rtl.frontend.pytorch_fx import load_model_from_file, parse_model
 from torch2rtl.quant.fixed_point import FixedPointConfig
-from torch2rtl.synth.yosys import run_yosys
+from torch2rtl.synth.yosys import SynthResult, run_yosys
 from torch2rtl.visualization import render_visualization_from_build
-from torch2rtl.verify.simulator import run_simulation
+from torch2rtl.verify.simulator import SimulationResult, run_simulation
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,11 +139,63 @@ def cmd_demo(args: argparse.Namespace) -> int:
         seed=args.seed,
         vector_index=args.vector_index,
     )
-    print(f"demo {result.name} -> {result.build_report.out_dir}")
-    print(f"simulation: {result.simulation.message}")
-    print(f"synthesis: {result.synthesis.message}")
-    print(f"html report: {result.visualization_path}")
+    for line in _format_demo_summary(result, detect_eda_tools()):
+        print(line)
     return 0 if result.ok else 1
+
+
+def _format_demo_summary(
+    result: DemoResult,
+    tools: Mapping[str, bool],
+) -> list[str]:
+    generated = tuple(result.build_report.generated_files)
+    rtl_files = _selected_files(generated, suffix=".sv")
+    test_data = _selected_files(
+        generated,
+        names={"input_vectors.txt", "expected_classes.txt", "vectors.json"},
+    )
+    missing_tools = ", ".join(name for name, available in tools.items() if not available)
+
+    lines = [
+        f"demo {result.name} summary",
+        f"build dir: {result.build_report.out_dir}",
+        f"compile: ok ({len(generated)} generated artifacts)",
+        f"rtl files: {_join_or_none(rtl_files)}",
+        f"test data: {_join_or_none(test_data)}",
+        _stage_line("verification", result.simulation),
+        _stage_line("synthesis", result.synthesis),
+        f"html report: {result.visualization_path}",
+        f"open for demo: {result.visualization_path}",
+    ]
+    if missing_tools:
+        lines.append(f"optional EDA tools missing: {missing_tools}")
+    return lines
+
+
+def _stage_line(label: str, result: SimulationResult | SynthResult) -> str:
+    if result.status == "not_found":
+        return f"{label}: skipped ({result.message})"
+    if result.ok:
+        return f"{label}: passed ({result.message})"
+    return f"{label}: failed ({result.message})"
+
+
+def _selected_files(
+    generated: tuple[str, ...],
+    suffix: str | None = None,
+    names: set[str] | None = None,
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    for file_name in generated:
+        if suffix is not None and file_name.endswith(suffix):
+            selected.append(file_name)
+        elif names is not None and file_name in names:
+            selected.append(file_name)
+    return tuple(selected)
+
+
+def _join_or_none(values: tuple[str, ...]) -> str:
+    return ", ".join(values) if values else "none"
 
 
 def main() -> int:

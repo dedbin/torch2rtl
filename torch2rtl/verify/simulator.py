@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from torch2rtl.eda_tools import find_eda_tool
 from torch2rtl.synth.report import update_report
@@ -91,12 +91,20 @@ def _patch_vvp_shebang(script_path: Path, vvp: str) -> None:
 
 
 def _vvp_runtime_path(vvp: str) -> str:
+    if _is_windows_path_text(vvp):
+        return PureWindowsPath(vvp).as_posix()
+
     path = Path(vvp).resolve()
     if path.suffix.lower() in {".bat", ".cmd"}:
         suite_vvp = path.parent.parent / "oss-cad-suite" / "bin" / "vvp.exe"
         if suite_vvp.exists():
             path = suite_vvp
     return path.as_posix()
+
+
+def _is_windows_path_text(path: str) -> bool:
+    windows_path = PureWindowsPath(path)
+    return bool(windows_path.drive) or "\\" in path
 
 
 def _run_verilator(build_dir: Path, verilator: str) -> SimulationResult:
