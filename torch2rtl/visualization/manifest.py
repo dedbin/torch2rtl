@@ -16,10 +16,18 @@ from torch2rtl.quant.reference import (
     QuantizedReluIR,
 )
 from torch2rtl.visualization.html import render_visualization_html
-from torch2rtl.visualization.trace import array_stats, qgraph_from_manifest, trace_payload
+from torch2rtl.visualization.trace import (
+    array_stats,
+    qgraph_from_manifest,
+    trace_collection_payload,
+    trace_payload,
+)
 
 MANIFEST_NAME = "visualization.json"
 HTML_NAME = "visualization.html"
+SOURCE_PREVIEW_MAX_LINES = 200
+SOURCE_PREVIEW_MAX_CHARS = 20_000
+SOURCE_PREVIEW_CHUNK_SIZE = 8_192
 
 
 def write_visualization_artifacts(
@@ -59,6 +67,12 @@ def render_visualization_from_build(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     qgraph = qgraph_from_manifest(manifest, build_dir)
     manifest["trace"] = trace_payload(qgraph, manifest, build_dir, vector_index)
+    manifest["traces"] = trace_collection_payload(
+        qgraph,
+        manifest,
+        build_dir,
+        selected_index=vector_index,
+    )
     manifest["build"] = _build_payload(
         build_dir=build_dir,
         generated_files=manifest.get("build", {}).get("generated_files", []),
@@ -102,6 +116,12 @@ def build_visualization_manifest(
         "ops": ops,
     }
     manifest["trace"] = trace_payload(qgraph, manifest, build_dir, vector_index)
+    manifest["traces"] = trace_collection_payload(
+        qgraph,
+        manifest,
+        build_dir,
+        selected_index=vector_index,
+    )
     return manifest
 
 
@@ -369,8 +389,9 @@ def _build_payload(build_dir: Path, generated_files: Sequence[str]) -> dict[str,
     report_path = build_dir / "report.json"
     if report_path.exists():
         report = json.loads(report_path.read_text(encoding="utf-8"))
+        report_generated_files = report.get("generated_files", list(generated_files))
         return {
-            "generated_files": report.get("generated_files", list(generated_files)),
+            "generated_files": report_generated_files,
             "tools": report.get("tools", {}),
             "environment": report.get("environment", {}),
             "status": report.get("status", {}),
@@ -379,9 +400,81 @@ def _build_payload(build_dir: Path, generated_files: Sequence[str]) -> dict[str,
             "reference": report.get("reference", {}),
             "simulation": report.get("simulation", {}),
             "synthesis": report.get("synthesis", {}),
-            "artifacts": _artifact_payload(build_dir, report.get("generated_files", [])),
+            "artifacts": _artifact_payload(build_dir, report_generated_files),
+            "source_previews": _source_preview_payload(
+                build_dir, report_generated_files
+            ),
         }
-    return {"generated_files": list(generated_files), "tools": {}, "status": {}}
+    return {
+        "generated_files": list(generated_files),
+        "tools": {},
+        "status": {},
+        "source_previews": _source_preview_payload(build_dir, generated_files),
+    }
+
+
+def _source_preview_payload(
+    build_dir: Path, generated_files: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    build_root = build_dir.resolve()
+    previews: dict[str, dict[str, Any]] = {}
+    for file_name in dict.fromkeys(str(name) for name in generated_files):
+        relative_path = Path(file_name)
+        if relative_path.is_absolute() or relative_path.suffix.lower() != ".sv":
+            continue
+
+        source_path = (build_root / relative_path).resolve()
+        if not source_path.is_relative_to(build_root) or not source_path.is_file():
+            continue
+
+        try:
+            previews[file_name] = _read_source_preview(source_path)
+        except OSError:
+            continue
+    return previews
+
+
+def _read_source_preview(source_path: Path) -> dict[str, Any]:
+    preview_parts: list[str] = []
+    preview_chars = 0
+    preview_newlines = 0
+    total_chars = 0
+    total_newlines = 0
+    last_char = ""
+
+    with source_path.open(encoding="utf-8", errors="replace") as source:
+        while chunk := source.read(SOURCE_PREVIEW_CHUNK_SIZE):
+            total_chars += len(chunk)
+            total_newlines += chunk.count("\n")
+            last_char = chunk[-1]
+
+            if (
+                preview_chars >= SOURCE_PREVIEW_MAX_CHARS
+                or preview_newlines >= SOURCE_PREVIEW_MAX_LINES
+            ):
+                continue
+
+            candidate = chunk[: SOURCE_PREVIEW_MAX_CHARS - preview_chars]
+            newline_budget = SOURCE_PREVIEW_MAX_LINES - preview_newlines
+            if candidate.count("\n") >= newline_budget:
+                end = 0
+                for _ in range(newline_budget):
+                    end = candidate.find("\n", end) + 1
+                candidate = candidate[:end]
+
+            preview_parts.append(candidate)
+            preview_chars += len(candidate)
+            preview_newlines += candidate.count("\n")
+
+    text = "".join(preview_parts)
+    line_count = total_newlines + int(total_chars > 0 and last_char != "\n")
+    shown_lines = text.count("\n") + int(bool(text) and not text.endswith("\n"))
+    return {
+        "text": text,
+        "line_count": line_count,
+        "shown_lines": shown_lines,
+        "truncated": total_chars > len(text),
+    }
 
 
 def _artifact_payload(build_dir: Path, generated_files: Sequence[str]) -> list[dict[str, Any]]:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch.nn as nn
 
+from examples.tiny_conv.model import create_model as create_tiny_conv
 from torch2rtl.backend.systemverilog.emit import emit_systemverilog
 from torch2rtl.frontend.pytorch_fx import parse_model
 from torch2rtl.quant.fixed_point import FixedPointConfig
@@ -22,6 +23,13 @@ def _emit_tiny_mlp(tmp_path: Path, vector_count: int = 3) -> Path:
     graph = parse_model(model, input_shape=(16,))
     cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=32)
     emit_systemverilog(graph, cfg, tmp_path, vector_count=vector_count, seed=1)
+    return tmp_path
+
+
+def _emit_tiny_conv(tmp_path: Path, vector_count: int = 16) -> Path:
+    graph = parse_model(create_tiny_conv(), input_shape=(1, 3, 3))
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=32)
+    emit_systemverilog(graph, cfg, tmp_path, vector_count=vector_count, seed=11)
     return tmp_path
 
 
@@ -56,6 +64,54 @@ def test_visualization_html_is_self_contained(tmp_path: Path) -> None:
     assert "Linear / MAC" in html
     assert "Torch2RTL" in html
     assert "visualization.json" in html
+    assert 'id="vector-dialog"' in html
+    assert 'id="source-drawer"' in html
+    assert 'data-action="play"' in html
+    assert 'data-view="overview"' in html
+    assert 'data-view="conv"' in html
+    assert 'data-view="mac"' in html
+    assert 'data-view="linear"' in html
+    assert 'data-view="yosys"' in html
+    assert 'data-view="mapping"' in html
+    assert "function stepBackward()" in html
+    assert "window.history.back()" not in html
+    assert '<script src=' not in html
+    assert '<link rel="stylesheet"' not in html
+
+
+def test_tiny_conv_visualization_embeds_exact_mac_trace(tmp_path: Path) -> None:
+    build_dir = _emit_tiny_conv(tmp_path)
+    manifest = json.loads((build_dir / "visualization.json").read_text(encoding="utf-8"))
+
+    assert manifest["traces"]["total_count"] == 16
+    assert manifest["traces"]["included_count"] == 16
+    assert len(manifest["traces"]["traces"]) == 16
+
+    trace = manifest["trace"]
+    assert trace["input"]["values"] == [-48, 0, 13, -60, -45, 55, -55, -47, 57]
+    assert trace["logits"]["values"] == [0, 19, 0, 8]
+    assert trace["class_id"] == 1
+    assert trace["matched"] is True
+
+    conv = next(step for step in trace["steps"] if step["kind"] == "conv2d")
+    assert conv["output"]["values"] == [-62, 19, -79, 8]
+    selected = next(
+        entry for entry in conv["hardware"]["output_entries"]
+        if entry["flat_index"] == 1
+    )
+    assert selected["index"] == [0, 0, 1]
+    assert [tap["input_raw"] for tap in selected["taps"]] == [0, 13, -45, 55]
+    assert [tap["weight_raw"] for tap in selected["taps"]] == [32, 16, 16, 32]
+    assert [tap["product_raw"] for tap in selected["taps"]] == [0, 208, -720, 1760]
+    assert [tap["accumulator_raw"] for tap in selected["taps"]] == [0, 208, -512, 1248]
+    assert selected["shifted_raw"] == 19
+    assert selected["output_raw"] == 19
+    assert selected["saturation_flag"] is False
+
+    sources = manifest["build"]["source_previews"]
+    assert "conv2d_comb.sv" in sources
+    assert "module" in sources["conv2d_comb.sv"]["text"]
+    assert sources["conv2d_comb.sv"]["shown_lines"] <= 200
 
 
 def test_visualize_cli_renders_from_existing_build(tmp_path: Path) -> None:
