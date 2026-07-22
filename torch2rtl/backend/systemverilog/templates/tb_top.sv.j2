@@ -11,11 +11,15 @@ module tb_top;
     logic signed [CLASS_COUNT*DATA_BITS-1:0] logits;
 
     integer fd_inputs;
+    integer fd_logits;
     integer fd_expected;
     integer status;
     integer idx;
     integer tmp;
     integer expected_class;
+    integer expected_logit;
+    logic signed [DATA_BITS-1:0] actual_logit;
+    integer logit_idx;
     integer vector_idx;
     integer errors;
 
@@ -28,7 +32,8 @@ module tb_top;
     initial begin
         fd_inputs = $fopen("input_vectors.txt", "r");
         fd_expected = $fopen("expected_classes.txt", "r");
-        if (fd_inputs == 0 || fd_expected == 0) begin
+        fd_logits = $fopen("expected_logits.txt", "r");
+        if (fd_inputs == 0 || fd_expected == 0 || fd_logits == 0) begin
             $display("FAIL: could not open vector files");
             $finish(1);
         end
@@ -49,6 +54,19 @@ module tb_top;
             if (class_id !== expected_class[CLASS_BITS-1:0]) begin
                 $display("FAIL vector=%0d expected=%0d got=%0d", vector_idx, expected_class, class_id);
                 errors = errors + 1;
+            end
+            for (logit_idx = 0; logit_idx < CLASS_COUNT; logit_idx = logit_idx + 1) begin
+                status = $fscanf(fd_logits, "%d", expected_logit);
+                if (status != 1) begin
+                    $display("FAIL vector=%0d logit=%0d missing expected logit value", vector_idx, logit_idx);
+                    errors = errors + 1;
+                end else begin
+                    actual_logit = $signed(logits[logit_idx*DATA_BITS +: DATA_BITS]);
+                    if (actual_logit !== expected_logit) begin
+                        $display("FAIL vector=%0d logit=%0d expected=%0d got=%0d", vector_idx, logit_idx, expected_logit, actual_logit);
+                        errors = errors + 1;
+                    end
+                end
             end
             vector_idx = vector_idx + 1;
         end

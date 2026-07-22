@@ -140,6 +140,7 @@ argmax.sv
 tb_top.sv
 input_vectors.txt
 expected_classes.txt
+expected_logits.txt
 *_weights.mem
 *_bias.mem
 report.json

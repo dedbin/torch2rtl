@@ -17,17 +17,23 @@ def write_vector_files(
     seed: int,
 ) -> list[str]:
     inputs = generate_random_inputs(qgraph.input_size, vector_count, cfg, seed)
+    results = [infer_quantized(qgraph, row) for row in inputs]
     expected = np.asarray(
-        [infer_quantized(qgraph, row).class_id for row in inputs],
+        [result.class_id for result in results],
         dtype=np.int64,
     )
-
+    logits = np.asarray(
+        [result.logits for result in results],
+        dtype=np.int64,
+    )
     input_path = out_dir / "input_vectors.txt"
-    expected_path = out_dir / "expected_classes.txt"
+    expected_classes = out_dir / "expected_classes.txt"
+    expected_logits = out_dir / "expected_logits.txt"
     np.savetxt(input_path, inputs, fmt="%d")
-    np.savetxt(expected_path, expected.reshape(-1, 1), fmt="%d")
+    np.savetxt(expected_classes, expected.reshape(-1, 1), fmt="%d")
+    np.savetxt(expected_logits, logits, fmt="%d")
 
-    generated = ["input_vectors.txt", "expected_classes.txt"]
+    generated = ["input_vectors.txt", "expected_classes.txt", "expected_logits.txt"]
     for op in qgraph.ops:
         if hasattr(op, "weight") and hasattr(op, "bias"):
             weight_path = out_dir / f"{op.name}_weights.mem"

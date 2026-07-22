@@ -152,7 +152,12 @@ def _format_demo_summary(
     rtl_files = _selected_files(generated, suffix=".sv")
     test_data = _selected_files(
         generated,
-        names={"input_vectors.txt", "expected_classes.txt", "vectors.json"},
+        names={
+            "input_vectors.txt",
+            "expected_classes.txt",
+            "expected_logits.txt",
+            "vectors.json",
+        },
     )
     missing_tools = ", ".join(name for name, available in tools.items() if not available)
 
