@@ -62,6 +62,18 @@ def test_tiny_conv_example_compiles(tmp_path: Path) -> None:
         LinearIR,
         ArgmaxIR,
     ]
+    conv = graph.ops[0]
+    linear = graph.ops[3]
+    assert isinstance(conv, Conv2dIR)
+    assert isinstance(linear, LinearIR)
+    assert conv.input.shape == (1, 3, 3)
+    assert conv.output.shape == (1, 2, 2)
+    assert conv.kernel_height == 2
+    assert conv.kernel_width == 2
+    assert conv.stride == (1, 1)
+    assert conv.padding == (0, 0)
+    assert linear.in_features == 4
+    assert linear.out_features == 4
 
     cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=32)
     report = emit_systemverilog(graph, cfg, tmp_path, vector_count=3, seed=11)
@@ -71,7 +83,9 @@ def test_tiny_conv_example_compiles(tmp_path: Path) -> None:
     assert "conv2d_comb.sv" in report.generated_files
     assert "visualization.html" in report.generated_files
     assert payload["graph"]["input_shape"] == [1, 3, 3]
-    assert payload["metrics"]["macs"] > 0
+    assert payload["quant"] == {"bits": 8, "frac_bits": 6, "acc_bits": 32}
+    assert payload["metrics"]["parameters"] == 25
+    assert payload["metrics"]["macs"] == 32
     assert payload["reference"]["kind"] == "fixed_vs_float_ir"
     assert [block["kind"] for block in manifest["blocks"] if block["lane"] == "main"] == [
         "input",
