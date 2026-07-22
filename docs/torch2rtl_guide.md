@@ -59,7 +59,7 @@ torch2rtl = "torch2rtl.cli:main"
   -> GraphIR
   -> квантованный граф
   -> SystemVerilog-файлы
-  -> input_vectors.txt и expected_classes.txt
+  -> input_vectors.txt, expected_classes.txt и expected_logits.txt
   -> моделирование через Icarus Verilog или Verilator
   -> простой проход Yosys
   -> visualization.json и visualization.html
@@ -298,7 +298,7 @@ def emit_systemverilog(
     ]
 ```
 
-Далее генератор создает файлы в выходном каталоге. Для `tiny-conv` ожидаются, в частности, `conv2d_comb.sv`, `linear_comb.sv`, `relu.sv`, `argmax.sv`, `top.sv`, `tb_top.sv`, `input_vectors.txt`, `expected_classes.txt`, файлы весов и смещений, `report.json`, `visualization.json`, `visualization.html`.
+Далее генератор создает файлы в выходном каталоге. Для `tiny-conv` ожидаются, в частности, `conv2d_comb.sv`, `linear_comb.sv`, `relu.sv`, `argmax.sv`, `top.sv`, `tb_top.sv`, `input_vectors.txt`, `expected_classes.txt`, `expected_logits.txt`, файлы весов и смещений, `report.json`, `visualization.json`, `visualization.html`.
 
 В `visualization.json` та же структура становится блоками. Тест `tests/test_examples.py` проверяет порядок основных блоков:
 
@@ -396,11 +396,12 @@ def test_quantization_clamps_correctly() -> None:
 | `linear_comb.sv` | Комбинационный полносвязный слой. |
 | `relu.sv` | Поэлементная отсечка отрицательных значений. |
 | `argmax.sv` | Выбор индекса максимального логита. |
-| `tb_top.sv` | Проверочный модуль, который читает входы и ожидаемые классы из текстовых файлов. |
+| `tb_top.sv` | Проверочный модуль, который читает входы и побитово сравнивает ожидаемые классы и logits. |
 | `*_weights.mem` | Целочисленные веса слоя после квантования. |
 | `*_bias.mem` | Целочисленные смещения слоя после квантования. |
 | `input_vectors.txt` | Сгенерированные входные векторы. |
 | `expected_classes.txt` | Ожидаемые классы по фиксированно-точечной эталонной модели. |
+| `expected_logits.txt` | Ожидаемые signed logits по фиксированно-точечной эталонной модели. |
 | `report.json` | Отчет о графе, параметрах, метриках, инструментах и проверках. |
 | `visualization.json` | Данные для страницы визуализации. |
 | `visualization.html` | Самодостаточная страница визуализации. |
@@ -551,7 +552,7 @@ HTML-страница самодостаточна: в нее встроены �
 - Запустить `torch2rtl demo --name tiny-conv --out build/demo`.
 - Открыть `build/demo/report.json` и показать список операций, параметры фиксированной точки и статусы инструментов.
 - Открыть `build/demo/top.sv` и показать, как слои соединены сигналами.
-- Открыть `build/demo/tb_top.sv` и показать чтение `input_vectors.txt` и `expected_classes.txt`.
+- Открыть `build/demo/tb_top.sv` и показать чтение `input_vectors.txt`, `expected_classes.txt` и `expected_logits.txt`.
 - Открыть `build/demo/visualization.html` в браузере и пройти по блокам схемы.
 
 Если симулятор или Yosys не установлены, это не обязательно ломает показ. Код `demo` считает такие статусы допустимыми: свойство `ok` в `DemoResult` принимает `not_found` как нефатальный результат для моделирования и синтеза.

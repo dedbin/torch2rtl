@@ -57,10 +57,14 @@ build/demo/argmax.sv
 ```text
 build/demo/input_vectors.txt
 build/demo/expected_classes.txt
+build/demo/expected_logits.txt
 build/demo/tb_top.sv
 ```
 
-`input_vectors.txt` содержит квантованные входы, `expected_classes.txt` - ожидаемые классы по фиксированно-точечной эталонной модели, а `tb_top.sv` читает эти файлы и сравнивает выход `class_id`.
+`input_vectors.txt` содержит квантованные входы, `expected_classes.txt` — ожидаемые
+классы, а `expected_logits.txt` — все выходные значения фиксированно-точечной
+эталонной модели. `tb_top.sv` читает эти файлы и побитово сравнивает с эталоном
+как `class_id`, так и каждый signed logit.
 
 ## 8. Моделирование
 

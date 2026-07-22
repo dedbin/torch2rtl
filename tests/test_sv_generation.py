@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch.nn as nn
 
 from torch2rtl.backend.systemverilog.emit import emit_systemverilog
@@ -19,6 +20,11 @@ def test_generated_sv_contains_expected_module_names(tmp_path: Path) -> None:
     cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=32)
     report = emit_systemverilog(graph, cfg, tmp_path, vector_count=2, seed=1)
 
+    assert "expected_logits.txt" in report.generated_files
+
+    expected_logits = np.loadtxt(tmp_path / "expected_logits.txt", dtype=np.int64)
+    assert expected_logits.shape == (2, 4)
+
     assert "top.sv" in report.generated_files
     assert "tb_top.sv" in report.generated_files
     assert (tmp_path / "top.sv").exists()
@@ -32,6 +38,8 @@ def test_generated_sv_contains_expected_module_names(tmp_path: Path) -> None:
     assert "module argmax" in combined
     assert "module top" in combined
     tb_top = (tmp_path / "tb_top.sv").read_text(encoding="utf-8")
+    assert '$fopen("expected_logits.txt", "r")' in tb_top
+    assert "actual_logit !== expected_logit" in tb_top
     assert 'while ($fscanf(fd_expected, "%d", expected_class) == 1)' in tb_top
     assert "while (!$feof" not in tb_top
 

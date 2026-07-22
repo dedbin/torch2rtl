@@ -44,6 +44,7 @@ def test_format_demo_summary_lists_demo_artifacts(tmp_path: Path) -> None:
             generated_files=(
                 "argmax.sv",
                 "expected_classes.txt",
+                "expected_logits.txt",
                 "input_vectors.txt",
                 "report.json",
                 "tb_top.sv",
@@ -72,9 +73,12 @@ def test_format_demo_summary_lists_demo_artifacts(tmp_path: Path) -> None:
     )
     text = "\n".join(lines)
 
-    assert "compile: ok (8 generated artifacts)" in text
+    assert "compile: ok (9 generated artifacts)" in text
     assert "rtl files: argmax.sv, tb_top.sv, top.sv" in text
-    assert "test data: expected_classes.txt, input_vectors.txt, vectors.json" in text
+    assert (
+        "test data: expected_classes.txt, expected_logits.txt, input_vectors.txt, "
+        "vectors.json" in text
+    )
     assert "verification: skipped" in text
     assert "synthesis: skipped" in text
     assert f"html report: {tmp_path / 'visualization.html'}" in text

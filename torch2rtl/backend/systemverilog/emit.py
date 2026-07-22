@@ -117,6 +117,7 @@ def _clear_previous_outputs(out_dir: Path) -> None:
         "argmax.sv",
         "conv2d_comb.sv",
         "expected_classes.txt",
+        "expected_logits.txt",
         "input_vectors.txt",
         "linear_comb.sv",
         "relu.sv",
