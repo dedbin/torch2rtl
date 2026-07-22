@@ -11,3 +11,7 @@ examples/tiny_mlp/*.pt
 examples/image_cnn/*.pt
 tools/downloads/
 tools/oss-cad-suite/
+# Local mentoring and execution plans
+/AGENTS.md
+/docs/12_week_execution_and_learning_plan.md
+/docs/week01_architecture.md
