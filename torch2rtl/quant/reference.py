@@ -109,6 +109,19 @@ class FloatReferenceResult:
     class_id: int
 
 
+def _check_accumulator_range(
+    value: int,
+    cfg: FixedPointConfig,
+) -> int:
+    if value < cfg.acc_min_int or value > cfg.acc_max_int:
+        raise OverflowError(
+            f"Value {value} does not fit signed {cfg.acc_bits}-bit "
+            f"accumulator range "
+            f"[{cfg.acc_min_int}, {cfg.acc_max_int}]"
+        )
+    return value
+
+
 def quantize_graph(graph: GraphIR, cfg: FixedPointConfig) -> QuantizedGraph:
     qops: list[QuantizedOp] = []
     for op in graph.ops:
@@ -167,8 +180,11 @@ def linear_fixed(
     outputs: list[int] = []
     for out_idx in range(w.shape[0]):
         acc = int(b[out_idx]) << cfg.frac_bits
+        acc = _check_accumulator_range(acc, cfg)
         for in_idx in range(w.shape[1]):
-            acc += int(x[in_idx]) * int(w[out_idx, in_idx])
+            product = int(x[in_idx]) * int(w[out_idx, in_idx])
+            product = _check_accumulator_range(product, cfg)
+            acc = _check_accumulator_range(acc + product, cfg)
         shifted = acc >> cfg.frac_bits
         outputs.append(saturate_int(shifted, cfg.bits))
     return np.asarray(outputs, dtype=np.int64)
@@ -199,6 +215,7 @@ def conv2d_fixed(
         for out_y in range(op.output_height):
             for out_x in range(op.output_width):
                 acc = int(bias[out_channel]) << cfg.frac_bits
+                acc = _check_accumulator_range(acc, cfg)
                 for in_channel in range(op.in_channels):
                     for kernel_y in range(op.kernel_height):
                         in_y = out_y * op.stride[0] + kernel_y - op.padding[0]
@@ -208,9 +225,11 @@ def conv2d_fixed(
                             in_x = out_x * op.stride[1] + kernel_x - op.padding[1]
                             if in_x < 0 or in_x >= op.input_width:
                                 continue
-                            acc += int(data[in_channel, in_y, in_x]) * int(
+                            product = int(data[in_channel, in_y, in_x]) * int(
                                 weight[out_channel, in_channel, kernel_y, kernel_x]
                             )
+                            product = _check_accumulator_range(product, cfg)
+                            acc = _check_accumulator_range(acc + product, cfg)
                 output[out_channel, out_y, out_x] = saturate_int(
                     acc >> cfg.frac_bits,
                     cfg.bits,

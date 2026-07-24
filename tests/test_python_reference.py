@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from torch2rtl.quant.fixed_point import FixedPointConfig
 from torch2rtl.quant.reference import (
@@ -71,3 +72,43 @@ def test_fixed_point_conv2d_matches_manual_calculation() -> None:
         output,
         np.asarray([[[7, 9], [13, 15]]], dtype=np.int64),
     )
+
+
+def test_linear_fixed_rejects_product_overflow() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    inputs = np.asarray([127], dtype=np.int64)
+    weight = np.asarray([[127]], dtype=np.int64)
+    bias = np.asarray([0], dtype=np.int64)
+    with pytest.raises(OverflowError):
+        linear_fixed(inputs, weight, bias, cfg)
+
+
+def test_linear_fixed_rejects_sum_overflow() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    inputs = np.asarray([127, 127], dtype=np.int64)
+    weight = np.asarray([[9, 9]], dtype=np.int64)
+    bias = np.asarray([0], dtype=np.int64)
+    with pytest.raises(OverflowError):
+        linear_fixed(inputs, weight, bias, cfg)
+
+
+def test_conv2d_fixed_rejects_product_overflow() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    op = QuantizedConv2dIR(
+        name="conv",
+        in_channels=1,
+        out_channels=1,
+        input_height=1,
+        input_width=1,
+        output_height=1,
+        output_width=1,
+        kernel_height=1,
+        kernel_width=1,
+        stride=(1, 1),
+        padding=(0, 0),
+        weight=np.asarray([[[[30]]]], dtype=np.int64),
+        bias=np.asarray([-16], dtype=np.int64),
+    )
+    inputs = np.asarray([100], dtype=np.int64)
+    with pytest.raises(OverflowError):
+        conv2d_fixed(inputs, op, cfg)
