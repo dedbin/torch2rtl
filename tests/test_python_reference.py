@@ -112,3 +112,77 @@ def test_conv2d_fixed_rejects_product_overflow() -> None:
     inputs = np.asarray([100], dtype=np.int64)
     with pytest.raises(OverflowError):
         conv2d_fixed(inputs, op, cfg)
+
+
+def test_linear_fixed_accepts_accumulator_max() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    output = linear_fixed(
+        np.asarray([89], dtype=np.int64),
+        np.asarray([[23]], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        cfg,
+    )
+    np.testing.assert_array_equal(output, np.asarray([31], dtype=np.int64))
+
+
+def test_linear_fixed_rejects_accumulator_max_plus_one() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    with pytest.raises(OverflowError):
+        linear_fixed(
+            np.asarray([64, 64], dtype=np.int64),
+            np.asarray([[16, 16]], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+            cfg,
+        )
+
+
+def test_linear_fixed_accepts_accumulator_min() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    output = linear_fixed(
+        np.asarray([-128], dtype=np.int64),
+        np.asarray([[16]], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
+        cfg,
+    )
+    np.testing.assert_array_equal(output, np.asarray([-32], dtype=np.int64))
+
+
+def test_linear_fixed_rejects_accumulator_min_minus_one() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    with pytest.raises(OverflowError):
+        linear_fixed(
+            np.asarray([-128, 1], dtype=np.int64),
+            np.asarray([[16, -1]], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+            cfg,
+        )
+
+
+def test_linear_fixed_uses_arithmetic_shift_for_negative_accumulator() -> None:
+    inputs = [-1]
+    weight = [[1], [63], [64], [65]]
+    bias = [0, 0, 0, 0]
+    expected = [-1, -1, -1, -2]
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    output = linear_fixed(inputs, weight, bias, cfg)
+    np.testing.assert_array_equal(output, expected)
+
+
+def test_linear_fixed_requantizes_without_additional_rounding() -> None:
+    inputs = [96]
+    weight = [[1]]
+    bias = [0]
+    expected = [1]
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=12)
+    output = linear_fixed(inputs, weight, bias, cfg)
+    np.testing.assert_array_equal(output, expected)
+
+
+def test_linear_fixed_saturates_output_at_signed_int8_boundaries() -> None:
+    inputs = [64]
+    weight = [[0], [1], [0], [-1]]
+    bias = [127, 127, -128, -128]
+    expected = [127, 127, -128, -128]
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=18)
+    output = linear_fixed(inputs, weight, bias, cfg)
+    np.testing.assert_array_equal(output, expected)
