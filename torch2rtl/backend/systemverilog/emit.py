@@ -26,7 +26,10 @@ from torch2rtl.quant.reference import (
 )
 from torch2rtl.visualization.manifest import HTML_NAME, MANIFEST_NAME, write_visualization_artifacts
 from torch2rtl.verify.source_integrity import RTL_SOURCE_NAMES
-from torch2rtl.verify.vectors import write_vector_files
+from torch2rtl.verify.vectors import (
+    _prepare_verification_vectors,
+    _write_prepared_vector_files,
+)
 
 
 @dataclass(frozen=True)
@@ -57,17 +60,31 @@ def emit_systemverilog(
     graph: GraphIR,
     cfg: FixedPointConfig,
     out_dir: Path,
-    vector_count: int = 16,
-    seed: int = 0,
+    vector_count: int | None = None,
+    seed: int | None = None,
+    *,
+    input_vectors: np.ndarray | None = None,
+    vector_source: str | None = None,
 ) -> BuildReport:
-    if isinstance(vector_count, bool) or not isinstance(vector_count, int):
-        raise TypeError("vector_count must be an integer")
-    if vector_count <= 0:
-        raise ValueError(f"vector_count must be positive, got {vector_count}")
+    qgraph = quantize_graph(graph, cfg)
+    vectors = _prepare_verification_vectors(
+        qgraph=qgraph,
+        cfg=cfg,
+        vector_count=vector_count,
+        seed=seed,
+        input_vectors=input_vectors,
+        vector_source=vector_source,
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     _clear_previous_outputs(out_dir)
-    qgraph = quantize_graph(graph, cfg)
-    vector_files = write_vector_files(out_dir, qgraph, cfg, vector_count, seed)
+    vector_files = _write_prepared_vector_files(
+        out_dir,
+        qgraph,
+        cfg,
+        vectors,
+    )
+    resolved_vector_count = vectors.count
+    resolved_vector_source = vectors.source
 
     env = _template_env()
     module_templates = {
@@ -80,7 +97,7 @@ def emit_systemverilog(
     generated: list[str] = []
     for output_name, template_name in module_templates.items():
         content = env.get_template(template_name).render(
-            **_common_context(qgraph, vector_count=vector_count)
+            **_common_context(qgraph, vector_count=resolved_vector_count)
         )
         (out_dir / output_name).write_text(content, encoding="utf-8")
         generated.append(output_name)
@@ -93,7 +110,15 @@ def emit_systemverilog(
     generated.append("report.json")
     generated.extend([MANIFEST_NAME, HTML_NAME])
 
-    report = _report_payload(graph, qgraph, cfg, out_dir, generated, vector_count)
+    report = _report_payload(
+        graph,
+        qgraph,
+        cfg,
+        out_dir,
+        generated,
+        resolved_vector_count,
+        resolved_vector_source,
+    )
     report_path = out_dir / "report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     write_visualization_artifacts(
@@ -101,7 +126,8 @@ def emit_systemverilog(
         qgraph=qgraph,
         build_dir=out_dir,
         generated_files=generated,
-        vector_count=vector_count,
+        vector_count=resolved_vector_count,
+        vector_source=resolved_vector_source,
     )
     return BuildReport(
         out_dir=out_dir,
@@ -265,6 +291,7 @@ def _report_payload(
     build_dir: Path,
     generated: list[str],
     vector_count: int,
+    vector_source: str,
 ) -> dict[str, Any]:
     return {
         "tool": "torch2rtl",
@@ -276,8 +303,15 @@ def _report_payload(
             "ops": [type(op).__name__ for op in graph.ops],
         },
         "metrics": _metrics_payload(qgraph),
-        "reference": _reference_payload(graph, qgraph, cfg, build_dir, vector_count),
-        "vectors": {"count": vector_count},
+        "reference": _reference_payload(
+            graph,
+            qgraph,
+            cfg,
+            build_dir,
+            vector_count,
+            vector_source,
+        ),
+        "vectors": {"count": vector_count, "source": vector_source},
         "generated_files": sorted(generated),
         "rtl_sha256": _rtl_source_hashes(build_dir),
         "tools": detect_eda_tools(),
@@ -358,6 +392,7 @@ def _reference_payload(
     cfg: FixedPointConfig,
     build_dir: Path,
     vector_count: int,
+    vector_source: str,
 ) -> dict[str, Any]:
     input_path = build_dir / "input_vectors.txt"
     if not input_path.exists():
@@ -379,6 +414,7 @@ def _reference_payload(
     return {
         "kind": "fixed_vs_float_ir",
         "source": "PyTorch weights lowered through GraphIR",
+        "vector_source": vector_source,
         "vectors": min(vector_count, int(len(inputs))),
         "class_matches": class_matches,
         "class_mismatches": int(len(inputs) - class_matches),

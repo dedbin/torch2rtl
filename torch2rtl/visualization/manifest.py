@@ -36,6 +36,7 @@ def write_visualization_artifacts(
     build_dir: Path,
     generated_files: Sequence[str],
     vector_count: int,
+    vector_source: str = "random_uniform",
     vector_index: int = 0,
 ) -> tuple[str, str]:
     manifest = build_visualization_manifest(
@@ -44,6 +45,7 @@ def write_visualization_artifacts(
         build_dir=build_dir,
         generated_files=generated_files,
         vector_count=vector_count,
+        vector_source=vector_source,
         vector_index=vector_index,
     )
     manifest_path = build_dir / MANIFEST_NAME
@@ -138,6 +140,7 @@ def build_visualization_manifest(
     build_dir: Path,
     generated_files: Sequence[str],
     vector_count: int,
+    vector_source: str = "random_uniform",
     vector_index: int = 0,
 ) -> dict[str, Any]:
     blocks, connections, ops = _circuit_payload(qgraph)
@@ -154,6 +157,7 @@ def build_visualization_manifest(
         "build": _build_payload(build_dir, generated_files),
         "vectors": {
             "count": vector_count,
+            "source": vector_source,
             "selected_index": vector_index,
             "input_file": "input_vectors.txt",
             "expected_file": "expected_classes.txt",

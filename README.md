@@ -51,6 +51,7 @@ flowchart LR
 | signed int8 fixed-point по умолчанию | есть |
 | combinational SystemVerilog backend | есть |
 | Python fixed-point reference | есть |
+| пользовательские quantized verification-векторы с provenance | есть |
 | RTL simulation через Icarus Verilog / Verilator | опционально |
 | Yosys synthesis/stat pass | опционально |
 | интерактивная HTML-визуализация схемы | есть |
@@ -310,6 +311,24 @@ uv --cache-dir temp/uv-cache run torch2rtl synth build/image_cnn/rtl
 - `rtl/report.json`
 - `rtl/visualization.html`
 
+### Iris MLP
+
+Воспроизводимый пример на bundled Iris dataset: stratified split `90/30/30`,
+train-only min-max normalization, обучение `Linear(4, 8) -> ReLU -> Linear(8, 3)`,
+checkpoint reload, GraphIR, Q8.4, 30 настоящих test inputs, RTL simulation и
+generic Yosys synthesis/stat.
+
+```bash
+uv --cache-dir temp/uv-cache sync --dev --extra iris --frozen
+uv --cache-dir temp/uv-cache run --frozen --extra iris python examples/iris_mlp/train.py
+uv --cache-dir temp/uv-cache run --frozen --extra iris python examples/iris_mlp/compile.py
+uv --cache-dir temp/uv-cache run --frozen torch2rtl verify build/iris_mlp/rtl_q8_4
+uv --cache-dir temp/uv-cache run --frozen torch2rtl synth build/iris_mlp/rtl_q8_4
+```
+
+Полный контракт, ожидаемые результаты и ограничения описаны в
+[`examples/iris_mlp/README.md`](examples/iris_mlp/README.md).
+
 ## CLI-шпаргалка
 
 ```bash
@@ -358,6 +377,7 @@ examples/
   grid_classifier/
   tiny_conv/
   image_cnn/
+  iris_mlp/
 ```
 
 Внутренний принцип простой: сначала получить маленький и понятный `GraphIR`,
@@ -386,6 +406,27 @@ uv --cache-dir temp/uv-cache run pytest -q
 - стабильные reference classes.
 
 ## Roadmap
+
+### Выполнено: пользовательские verification-векторы
+
+- [x] Добавлена в публичный flow возможность передавать собственные входные
+  векторы вместо обязательной генерации случайных данных по `vector_count` и
+  `seed`.
+- Ожидаемые fixed-point logits и классы должен вычислять сам `torch2rtl` через
+  `QuantizedGraph`; пользователь передаёт только входы и их provenance. Это
+  сохраняет независимость эталона от RTL и исключает ручную подмену
+  `input_vectors.txt`, `expected_logits.txt` и `expected_classes.txt`.
+- `vectors.json`, `report.json`, `visualization.json` и testbench должны
+  создаваться из одного и того же набора входов за один проход. После генерации
+  не должно требоваться ручное обновление отчёта или визуализации.
+- Публичный API должен явно проверять форму, количество, целочисленный тип и
+  диапазон входов для выбранного fixed-point формата, а также сохранять источник
+  данных, например `iris_test_split`.
+- Критерий готовности: вызов наподобие
+  `emit_systemverilog(..., input_vectors=inputs, vector_source="iris_test_split")`
+  сразу создаёт согласованные RTL-артефакты, проходит Icarus/Verilator и имеет
+  directed-тест, доказывающий, что симуляция использовала именно переданные
+  векторы, а не случайно сгенерированные.
 
 - `v0.1`: Linear / ReLU / Flatten / Argmax.
 - `v0.2`: Semantic Correctness и воспроизводимый board-free release gate.
