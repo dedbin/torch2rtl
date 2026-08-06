@@ -123,8 +123,6 @@ def test_generated_rtl_matches_python_on_directed_boundary_vectors(
         )
     graph = parse_model(model, input_shape=(2,))
     cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=16)
-    emit_systemverilog(graph, cfg, tmp_path, vector_count=6, seed=0)
-    qgraph = quantize_graph(graph, cfg)
     inputs = np.asarray(
         [
             [127, 127],
@@ -136,22 +134,31 @@ def test_generated_rtl_matches_python_on_directed_boundary_vectors(
         ],
         dtype=np.int64,
     )
+    emit_systemverilog(
+        graph,
+        cfg,
+        tmp_path,
+        input_vectors=inputs,
+        vector_source="directed_boundary_test",
+    )
+    qgraph = quantize_graph(graph, cfg)
     results = [infer_quantized(qgraph, row) for row in inputs]
     expected_logits = np.asarray([result.logits for result in results], dtype=np.int64)
     expected_classes = np.asarray(
         [result.class_id for result in results],
         dtype=np.int64,
     )
-    np.savetxt(tmp_path / "input_vectors.txt", inputs, fmt="%d")
-    np.savetxt(
-        tmp_path / "expected_logits.txt",
-        expected_logits,
-        fmt="%d",
+    np.testing.assert_array_equal(
+        np.loadtxt(tmp_path / "input_vectors.txt", dtype=np.int64),
+        inputs,
     )
-    np.savetxt(
-        tmp_path / "expected_classes.txt",
-        expected_classes.reshape(-1, 1),
-        fmt="%d",
+    np.testing.assert_array_equal(
+        np.loadtxt(tmp_path / "expected_logits.txt", dtype=np.int64),
+        expected_logits,
+    )
+    np.testing.assert_array_equal(
+        np.loadtxt(tmp_path / "expected_classes.txt", dtype=np.int64),
+        expected_classes,
     )
 
     simulation = run_simulation(tmp_path)

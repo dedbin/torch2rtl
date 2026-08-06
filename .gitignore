@@ -9,6 +9,7 @@ dist/
 temp/
 examples/tiny_mlp/*.pt
 examples/image_cnn/*.pt
+examples/iris_mlp/*.pt
 tools/downloads/
 tools/oss-cad-suite/
 # Local mentoring and execution plans
