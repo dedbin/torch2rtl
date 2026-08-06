@@ -94,7 +94,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(result.stdout)
     if result.stderr:
         print(result.stderr)
-    return 0 if result.ok or result.status == "not_found" else 1
+    return 0 if result.ok else 1
 
 
 def cmd_synth(args: argparse.Namespace) -> int:
@@ -104,7 +104,7 @@ def cmd_synth(args: argparse.Namespace) -> int:
         print(result.stdout)
     if result.stderr:
         print(result.stderr)
-    return 0 if result.ok or result.status == "not_found" else 1
+    return 0 if result.ok else 1
 
 
 def cmd_visualize(args: argparse.Namespace) -> int:

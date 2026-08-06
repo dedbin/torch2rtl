@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -24,6 +25,7 @@ from torch2rtl.quant.reference import (
     quantize_graph,
 )
 from torch2rtl.visualization.manifest import HTML_NAME, MANIFEST_NAME, write_visualization_artifacts
+from torch2rtl.verify.source_integrity import RTL_SOURCE_NAMES
 from torch2rtl.verify.vectors import write_vector_files
 
 
@@ -58,6 +60,10 @@ def emit_systemverilog(
     vector_count: int = 16,
     seed: int = 0,
 ) -> BuildReport:
+    if isinstance(vector_count, bool) or not isinstance(vector_count, int):
+        raise TypeError("vector_count must be an integer")
+    if vector_count <= 0:
+        raise ValueError(f"vector_count must be positive, got {vector_count}")
     out_dir.mkdir(parents=True, exist_ok=True)
     _clear_previous_outputs(out_dir)
     qgraph = quantize_graph(graph, cfg)
@@ -73,7 +79,9 @@ def emit_systemverilog(
     }
     generated: list[str] = []
     for output_name, template_name in module_templates.items():
-        content = env.get_template(template_name).render(**_common_context(qgraph))
+        content = env.get_template(template_name).render(
+            **_common_context(qgraph, vector_count=vector_count)
+        )
         (out_dir / output_name).write_text(content, encoding="utf-8")
         generated.append(output_name)
 
@@ -141,16 +149,24 @@ def _clear_previous_outputs(out_dir: Path) -> None:
                 path.unlink()
 
 
-def _common_context(qgraph: QuantizedGraph) -> dict[str, Any]:
+def _common_context(
+    qgraph: QuantizedGraph,
+    vector_count: int | None = None,
+) -> dict[str, Any]:
     class_count = _class_count(qgraph)
-    return {
+    context = {
         "data_bits": qgraph.cfg.bits,
         "frac_bits": qgraph.cfg.frac_bits,
         "acc_bits": qgraph.cfg.acc_bits,
+        "data_min_abs": abs(qgraph.cfg.min_int),
+        "data_max": qgraph.cfg.max_int,
         "input_size": qgraph.input_size,
         "class_count": class_count,
         "class_bits": _ceil_log2(class_count),
     }
+    if vector_count is not None:
+        context["expected_vectors"] = vector_count
+    return context
 
 
 def _top_context(qgraph: QuantizedGraph) -> dict[str, Any]:
@@ -263,8 +279,16 @@ def _report_payload(
         "reference": _reference_payload(graph, qgraph, cfg, build_dir, vector_count),
         "vectors": {"count": vector_count},
         "generated_files": sorted(generated),
+        "rtl_sha256": _rtl_source_hashes(build_dir),
         "tools": detect_eda_tools(),
         "status": {},
+    }
+
+
+def _rtl_source_hashes(build_dir: Path) -> dict[str, str]:
+    return {
+        name: hashlib.sha256((build_dir / name).read_bytes()).hexdigest()
+        for name in RTL_SOURCE_NAMES
     }
 
 
@@ -369,14 +393,12 @@ def _reference_payload(
 
 def _load_input_vectors(path: Path, input_size: int) -> np.ndarray:
     values = np.loadtxt(path, dtype=np.int64)
-    data = np.asarray(values, dtype=np.int64)
-    if data.ndim == 0:
-        return data.reshape(1, 1)
-    if data.ndim == 1:
-        if input_size == 1:
-            return data.reshape(-1, 1)
-        return data.reshape(1, input_size)
-    return data
+    data = np.asarray(values, dtype=np.int64).reshape(-1)
+    if data.size % input_size != 0:
+        raise ValueError(
+            f"input vector value count {data.size} is not divisible by {input_size}"
+        )
+    return data.reshape(-1, input_size)
 
 
 def _ceil_log2(value: int) -> int:

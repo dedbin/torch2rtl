@@ -41,11 +41,15 @@ torch2rtl = "torch2rtl.cli:main"
 
 Из кода и тестов подтверждены такие поддерживаемые операции:
 
-- `torch.nn.Linear`;
+- `torch.nn.Linear` только для 1-D вектора признаков;
 - `torch.nn.ReLU`;
-- `torch.nn.Flatten`;
+- `torch.nn.Flatten`, только полное преобразование в один вектор;
 - `torch.nn.Conv2d` без размерности пакета данных, с обычными группами `groups=1`, нулевым дополнением и `dilation=1`;
-- `argmax`, явный в модели или автоматически добавленный в конце.
+- финальный глобальный `argmax(dim=None, keepdim=False)`.
+
+FX-граф должен быть одной последовательной цепочкой с одним входом и одним
+тензорным выходом. Точные границы подмножества зафиксированы в
+`docs/v0.2_semantic_correctness.md`.
 
 Ключевое проектное решение: сначала строится маленькое внутреннее представление, а уже потом из него создаются фиксированно-точечная эталонная модель, SystemVerilog, проверочные векторы, отчет и визуализация. Поэтому новые операции нужно добавлять не во все места сразу хаотично, а последовательно: разбор PyTorch, внутреннее представление, квантование, эталонный расчет, шаблон SystemVerilog, тесты.
 
@@ -246,7 +250,7 @@ def emit_systemverilog(
         )
 ```
 
-Вход имеет форму `(1, 3, 3)`: один канал, три строки, три столбца. Свертка с ядром `2x2` без дополнения дает выход `(1, 2, 2)`. После `Flatten(start_dim=0)` четыре значения становятся вектором длины 4. Последний слой `Linear(4, 4)` оставляет четыре логита, а затем проект добавляет `ArgmaxIR`, если явного выбора класса в модели нет.
+Вход имеет форму `(1, 3, 3)`: один канал, три строки, три столбца. Свертка с ядром `2x2` без дополнения дает выход `(1, 2, 2)`. После `Flatten(start_dim=0)` четыре значения становятся вектором длины 4. Последний слой `Linear(4, 4)` оставляет четыре логита. Это настоящий выход PyTorch и GraphIR. Hardware-lowering дополнительно вычисляет `class_id`, не подменяя логиты.
 
 Веса в примере заданы вручную, а не обучены. Фрагмент из `examples/tiny_conv/model.py`:
 
@@ -294,7 +298,6 @@ def emit_systemverilog(
         ReluIR,
         FlattenIR,
         LinearIR,
-        ArgmaxIR,
     ]
 ```
 
@@ -330,20 +333,26 @@ class FixedPointConfig:
     acc_bits: int = 32
 
     def __post_init__(self) -> None:
-        if self.bits < 2:
-            raise ValueError("bits must be at least 2 for signed fixed-point")
-        if self.frac_bits < 0:
-            raise ValueError("frac_bits must be non-negative")
-        if self.acc_bits <= self.bits:
-            raise ValueError("acc_bits must be larger than bits")
+        # Полная реализация также проверяет integer-типы, исключая bool.
+        if not 2 <= self.bits <= 32:
+            raise ValueError("bits must be in the supported signed range 2..32")
+        if not 0 <= self.frac_bits < self.bits:
+            raise ValueError("frac_bits must satisfy 0 <= frac_bits < bits")
+        if not self.bits < self.acc_bits <= 64:
+            raise ValueError("acc_bits must satisfy bits < acc_bits <= 64")
 ```
 
 Квантование округляет значение после умножения на масштаб, затем применяет насыщение:
 
 ```python
 def quantize_array(values: np.ndarray, cfg: FixedPointConfig) -> np.ndarray:
-    scaled = np.rint(np.asarray(values, dtype=np.float64) * cfg.scale)
-    return saturate_array(scaled, cfg.bits).astype(np.int64)
+    source = np.asarray(values)
+    # Реализация принимает float32/float64, проверяет finite и сохраняет
+    # исходный floating dtype при умножении и ties-to-even rounding.
+    # Overflow конечного float при масштабировании означает saturation.
+    with np.errstate(over="ignore"):
+        scaled = np.rint(source * np.asarray(cfg.scale, dtype=source.dtype))
+    return saturate_array(scaled.astype(np.float64), cfg.bits).astype(np.int64)
 ```
 
 Для слоя `Linear` эталонный расчет на Python сначала переносит смещение в разрядность аккумулятора, затем накапливает произведения и сдвигает результат обратно на число дробных битов. Фрагмент из `torch2rtl/quant/reference.py`:
@@ -439,16 +448,38 @@ module top #(
     end
 ```
 
-Проверочный модуль читает ожидаемый класс и входные значения, подает их в `top` и сравнивает выход. Фрагмент из `torch2rtl/backend/systemverilog/templates/tb_top.sv.j2`:
+Проверочный модуль знает точное положительное число векторов, читает ровно это
+число записей и после цикла проверяет EOF каждого файла. Фрагмент из
+`torch2rtl/backend/systemverilog/templates/tb_top.sv.j2`:
 
 ```systemverilog
-        while ($fscanf(fd_expected, "%d", expected_class) == 1) begin
+        for (vector_idx = 0; vector_idx < EXPECTED_VECTORS; vector_idx = vector_idx + 1) begin
+            status = $fscanf(fd_expected, "%s", token);
+            if (status != 1) begin
+                $display("FAIL vector=%0d missing expected class", vector_idx);
+                errors = errors + 1;
+            end else if ($sscanf(token, "%d", expected_class) != 1 ||
+                         token != $sformatf("%0d", expected_class)) begin
+                $display("FAIL vector=%0d malformed expected class", vector_idx);
+                errors = errors + 1;
+            end else if (expected_class < 0 || expected_class >= CLASS_COUNT) begin
+                $display("FAIL vector=%0d expected class out of range: %0d", vector_idx, expected_class);
+                errors = errors + 1;
+            end
             for (idx = 0; idx < INPUT_SIZE; idx = idx + 1) begin
-                status = $fscanf(fd_inputs, "%d", tmp);
+                status = $fscanf(fd_inputs, "%s", token);
                 if (status != 1) begin
                     $display("FAIL vector=%0d input=%0d missing input value", vector_idx, idx);
                     errors = errors + 1;
                     tmp = 0;
+                end else if ($sscanf(token, "%d", tmp) != 1 ||
+                             token != $sformatf("%0d", tmp)) begin
+                    $display("FAIL vector=%0d input=%0d malformed value", vector_idx, idx);
+                    errors = errors + 1;
+                    tmp = 0;
+                end else if (tmp < DATA_MIN || tmp > DATA_MAX) begin
+                    $display("FAIL vector=%0d input=%0d value out of range: %0d", vector_idx, idx, tmp);
+                    errors = errors + 1;
                 end
                 in_data[idx*DATA_BITS +: DATA_BITS] = tmp[DATA_BITS-1:0];
             end
@@ -459,11 +490,24 @@ module top #(
             end
 ```
 
+Каждое значение сначала читается в `string` и принимается только если 64-битный
+signed `%d` разбор обратимо даёт ту же каноническую decimal-строку. Поэтому даже
+`value + 2^64` не может обернуться в исходное значение. `tmp`, `expected_class`
+и `expected_logit` затем проверяются по диапазону до среза аппаратной шины. После цикла
+отдельные чтения отвергают лишние или malformed значения в input, classes и
+logits. Host-validator сверяет metadata с единственными активными localparam,
+лексически различая SystemVerilog-код, строки и line/block comments. Поэтому
+`localparam` внутри строки или комментария не может подменить реально
+скомпилированный контракт. Preprocessor directives запрещены, а сами параметры
+должны находиться в строгом generated header сразу после `module tb_top`, не во
+вложенной области. Runner принимает только единственную точную строку
+`PASS vectors=N`, где `N > 0` и совпадает с metadata.
+
 Текущие SystemVerilog-модули описывают комбинационную схему. Это видно по интерфейсу `top.sv`: нет тактового входа, сброса, сигналов готовности или потокового протокола. Такой выбор делает результат проще для чтения и проверки, но накладывает ограничения на размер моделей и на практическое использование.
 
 # Установка и запуск
 
-Проект требует Python версии `3.11` или новее. В `README.md` рекомендован запуск через `uv`:
+Release v0.2 поддерживает только Python `>=3.12,<3.13`. Python 3.11 и 3.13 не входят в подтвержденную границу поддержки. В `README.md` рекомендован запуск через `uv`:
 
 ```bash
 uv --cache-dir temp/uv-cache sync --dev
@@ -495,7 +539,12 @@ uv --cache-dir temp/uv-cache run torch2rtl demo --name tiny-conv --out build/dem
 uv --cache-dir temp/uv-cache run torch2rtl demo tiny-conv --out build/demo
 ```
 
-Доступные демонстрации перечислены в `torch2rtl/demo.py`: `tiny-mlp`, `grid-classifier`, `tiny-conv`, `image-cnn`. Для `image-cnn` модель может загрузить checkpoint из `build/image_cnn/image_cnn.pt`, если он есть; отдельный скрипт `examples/image_cnn/train.py` умеет такой checkpoint создать.
+Доступные демонстрации перечислены в `torch2rtl/demo.py`: `tiny-mlp`,
+`grid-classifier`, `tiny-conv`, `image-cnn`. Скрипты compile для обучаемых
+примеров загружают checkpoint: `tiny_mlp/compile.py` требует явный
+`--checkpoint`, а `image_cnn/compile.py` использует свой checkpoint path.
+Model-файлы этих четырёх demo включаются в wheel, поэтому та же команда `demo`
+работает и из установленного пакета без исходного checkout.
 
 # Проверка результата
 
@@ -514,13 +563,20 @@ uv --cache-dir temp/uv-cache run torch2rtl demo tiny-conv --out build/demo
 uv --cache-dir temp/uv-cache run torch2rtl verify build/tiny_conv
 ```
 
-Если доступен Icarus Verilog, проект компилирует источники командой вида `iverilog -g2012 -o simv ...`, затем запускает `vvp`. Если Icarus Verilog не найден, но найден Verilator, используется Verilator. Если симулятор не найден, команда возвращает успешный код для статуса `not_found`, печатает понятное сообщение и обновляет отчет.
+Если доступен Icarus Verilog, проект компилирует источники командой вида
+`iverilog -g2012 -o simv ...`, затем запускает `vvp`. Если Icarus Verilog не
+найден, но найден Verilator, используется Verilator. Если симулятор не найден,
+явная команда `verify` возвращает ненулевой код. Только `demo` может обозначить
+внешний EDA-этап как optional/skipped.
 
-Успех моделирования определяется строкой `PASS` без строк `FAIL`. Это зафиксировано в `tests/test_simulator_runner.py`:
+Успех моделирования определяется точной строкой `PASS vectors=N` с `N > 0`,
+без строк `FAIL` и с совпадением `N` с metadata. Это зафиксировано в
+`tests/test_simulator_runner.py`:
 
 ```python
 def test_simulation_ok_requires_pass_without_failures() -> None:
     assert _simulation_ok(0, "PASS vectors=16\n")
+    assert not _simulation_ok(0, "PASS vectors=0\n")
     assert not _simulation_ok(0, "FAIL vector=16 expected=2 got=1\nFAIL errors=1\n")
     assert not _simulation_ok(1, "PASS vectors=16\n")
 ```
@@ -572,14 +628,59 @@ HTML-страница самодостаточна: в нее встроены �
 Ограничения ниже подтверждены кодом разбора, тестами и текущими шаблонами:
 
 - нет поддержки размерности пакета данных для `Conv2d`;
+- `Linear` поддерживает только 1-D вход без batch/prefix dimensions;
+- `Flatten` должен превращать весь тензор в один вектор;
+- FX-граф должен быть одной цепочкой без ветвлений и нескольких выходов;
+- explicit `argmax` поддержан только с `dim=None, keepdim=False`;
+- dtype параметров и buffers должен быть однородным `float32` или `float64`;
+- module/global hooks, subclasses, custom metaclasses, instance `forward`/call
+  overrides, custom
+  call/attribute/copy descriptors, decorated `forward` и переопределённые
+  module-introspection API отклоняются для любого вложенного модуля;
+- custom Python bytecode вне закрытого подмножества, nested code objects,
+  conditions, loops, exception handling, FX Proxy introspection и
+  tensor-dependent formatting отклоняются до trace;
+- class-level/external Python state и module-owned state, изменяемое во время FX
+  trace или concrete semantic probe, отклоняются; обе проверки выполняются на
+  копиях и не меняют исходную модель;
+- параметры/buffers должны быть точными `Parameter`/`Tensor` с обычными
+  string-именами на CPU, с layout `strided` и contiguous storage; tensor
+  subclasses, negative/conjugate view bits, сохранённый `.grad`, прямое
+  tensor/ndarray instance-state и доступ custom `forward` к внутренним registries
+  отклоняются;
+- monkeypatch стандартных PyTorch classes, forward definitions и functional
+  kernels, а также FX graph/tracer classes не входит в поддерживаемую семантику;
+- `ReLU(inplace=True)` отклоняется, потому что RTL не моделирует мутацию входа;
 - нет динамического управления исполнением модели;
 - форма входа должна быть известна при запуске `compile`;
+- input shape должна быть конечным `Sequence` с rank ≤ 64 и не более
+  1 000 000 элементов; output `Conv2d` имеет тот же element limit;
 - нет обучения, обратного распространения ошибки и логики GPU внутри компилятора;
 - для `Conv2d` поддержаны только `groups=1`, нулевое дополнение и `dilation=1`;
+- `kernel_size`/`stride` должны быть положительными integer, `padding` —
+  неотрицательным, формы параметров обязаны совпадать с атрибутами, а structural
+  values и максимальная координата должны помещаться в signed 32-bit
+  SystemVerilog `int`;
+- structural sizes должны быть положительными built-in `int`; input dimensions
+  и `Flatten.start_dim/end_dim` не преобразуют `bool`, строки или subclasses;
 - нет grouped convolution, depthwise convolution, normalization, attention и больших современных архитектур;
 - текущая схема комбинационная и не имеет потокового интерфейса;
 - Yosys используется только для простого `read_verilog`, `prep -top top`, `stat`;
-- проверочные векторы случайны и строятся для фиксированно-точечной эталонной модели, а не для полного набора входов;
+- проверочные векторы случайны и строятся для фиксированно-точечной эталонной
+  модели, а не для полного набора входов; перед EDA metadata сверяется с
+  полностью каноническим testbench, `top.sv` и report, а input/logits/class
+  проверяются по разрядным диапазонам; simulation-control constructs в DUT
+  sources запрещены вне testbench, SHA-256 manifest привязывает каждый RTL source
+  к compile output, а synth preflight сверяет report widths/sizes с top/TB/vector
+  metadata без чтения vector payload; synthesis result не теряется, если
+  подробный visualization trace недоступен из-за повреждённых векторов;
+- эти проверки обнаруживают случайное повреждение проверяемого generated contract;
+- одиночная несогласованная правка RTL, testbench, vector или обязательной report metadata даёт preflight либо bit-exact failure;
+- SHA-256 гарантированно связывает только RTL sources, а для vectors и report проверяются структура, диапазоны и contract-bearing metadata;
+- обнаружение произвольной допустимой замены vector payload без изменения результата или несвязанного report-поля не гарантируется;
+- локальный manifest хранится в том же build directory и не является внешним корнем доверия;
+- согласованная злонамеренная замена RTL, vectors, report и хешей одновременно находится вне threat model;
+- защита от такого сценария потребовала бы внешней подписи, доверенного manifest либо полной регенерации из доверенных исходников;
 - качество классификации зависит от выбранной модели и квантования; проект не доказывает точность модели на реальном наборе данных.
 
 Если граф содержит неподдержанный узел, `parse_model` выбрасывает `UnsupportedOpError`. Это лучше, чем молча сгенерировать неправильную схему: пользователь сразу видит, на какой операции остановился разбор.
@@ -591,8 +692,8 @@ HTML-страница самодостаточна: в нее встроены �
 | Версия | Направление |
 | --- | --- |
 | `v0.1` | `Linear`, `ReLU`, `Flatten`, `Argmax`. |
-| `v0.2` | Вертикальный срез для `Conv2d`. |
-| `v0.3` | Демонстрационный маршрут без платы. |
+| `v0.2` | Semantic Correctness и воспроизводимый board-free release gate. |
+| `v0.3` | Проверка accuracy обученной CNN по цепочке float → fixed → RTL. |
 | `v0.4` | Последовательный генератор MAC. |
 | `v0.5` | Потоковый интерфейс или интерфейс, похожий на AXI. |
 

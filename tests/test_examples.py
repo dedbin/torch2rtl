@@ -8,7 +8,7 @@ from types import ModuleType
 
 from torch2rtl.backend.systemverilog.emit import emit_systemverilog
 from torch2rtl.frontend.pytorch_fx import parse_model
-from torch2rtl.ir.ops import ArgmaxIR, Conv2dIR, FlattenIR, LinearIR, ReluIR
+from torch2rtl.ir.ops import Conv2dIR, FlattenIR, LinearIR, ReluIR
 from torch2rtl.quant.fixed_point import FixedPointConfig
 
 
@@ -24,7 +24,6 @@ def test_grid_classifier_example_compiles(tmp_path: Path) -> None:
         LinearIR,
         ReluIR,
         LinearIR,
-        ArgmaxIR,
     ]
     assert graph.linear_ops[0].in_features == 16
     assert graph.linear_ops[-1].out_features == 4
@@ -43,7 +42,6 @@ def test_grid_classifier_example_compiles(tmp_path: Path) -> None:
         "LinearIR",
         "ReluIR",
         "LinearIR",
-        "ArgmaxIR",
     ]
 
 
@@ -60,7 +58,6 @@ def test_tiny_conv_example_compiles(tmp_path: Path) -> None:
         ReluIR,
         FlattenIR,
         LinearIR,
-        ArgmaxIR,
     ]
     conv = graph.ops[0]
     linear = graph.ops[3]
@@ -123,7 +120,6 @@ def test_image_cnn_example_compiles(tmp_path: Path) -> None:
         ReluIR,
         FlattenIR,
         LinearIR,
-        ArgmaxIR,
     ]
 
     cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=32)

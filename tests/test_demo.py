@@ -118,6 +118,51 @@ def test_parse_yosys_metrics_extracts_design_hierarchy() -> None:
     assert metrics["cell_types"]["$mul"] == 640
 
 
+def test_parse_yosys_metrics_extracts_number_of_format() -> None:
+    log = """
+=== design hierarchy ===
+
+   top                               1
+     $paramod$abc\\linear_comb      1
+
+   Number of wires:                342
+   Number of wire bits:          10326
+   Number of public wires:         233
+   Number of public wire bits:    7924
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of processes:              0
+   Number of cells:                115
+     $add                           32
+     $gt                            11
+     $lt                            12
+     $mul                           32
+     $mux                           25
+     $or                             3
+"""
+
+    metrics = parse_yosys_metrics(log)
+
+    assert metrics == {
+        "wires": 342,
+        "wire_bits": 10326,
+        "public_wires": 233,
+        "public_wire_bits": 7924,
+        "memories": 0,
+        "memory_bits": 0,
+        "processes": 0,
+        "cells": 115,
+        "cell_types": {
+            "$add": 32,
+            "$gt": 11,
+            "$lt": 12,
+            "$mul": 32,
+            "$mux": 25,
+            "$or": 3,
+        },
+    }
+
+
 def test_run_demo_tiny_conv_creates_board_free_artifacts(tmp_path: Path) -> None:
     result = run_demo("tiny-conv", out_dir=tmp_path, vectors=2, seed=5)
 
@@ -137,6 +182,9 @@ def test_run_demo_tiny_conv_creates_board_free_artifacts(tmp_path: Path) -> None
     assert "environment" in report
     assert "simulation" in report
     assert "synthesis" in report
+    if result.synthesis.ok:
+        assert report["synthesis"]["metrics"]["cells"] > 0
+        assert report["synthesis"]["metrics"]["cell_types"]
     assert manifest["build"]["demo"]["name"] == "tiny-conv"
     assert manifest["build"]["artifacts"]
     assert "Ресурсы синтеза" in html

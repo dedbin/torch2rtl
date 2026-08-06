@@ -1,6 +1,6 @@
 # torch2rtl
 
-![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-FX%20to%20RTL-EE4C2C?logo=pytorch&logoColor=white)
 ![SystemVerilog](https://img.shields.io/badge/SystemVerilog-generated-2B6CB0)
 ![License](https://img.shields.io/badge/license-MIT-111827)
@@ -37,21 +37,45 @@ flowchart LR
 
 ## Что уже умеет
 
-Поддерживается MVP `v0.2`:
+Поддерживается MVP `v0.2 Semantic Correctness`. Точный контракт форм, FX-графа,
+выхода и fixed-point арифметики описан в
+[`docs/v0.2_semantic_correctness.md`](docs/v0.2_semantic_correctness.md).
 
 | Возможность | Статус |
 | --- | --- |
-| `torch.nn.Linear` | есть |
+| `torch.nn.Linear` для вектора `(in_features,)` | есть |
 | `torch.nn.ReLU` | есть |
-| `torch.nn.Flatten` | есть |
+| полное `torch.nn.Flatten` в один вектор | есть |
 | `torch.nn.Conv2d` для статического unbatched входа `(C, H, W)` | есть |
-| финальный `argmax` | есть |
+| финальный глобальный `argmax(dim=None, keepdim=False)` | есть |
 | signed int8 fixed-point по умолчанию | есть |
 | combinational SystemVerilog backend | есть |
 | Python fixed-point reference | есть |
 | RTL simulation через Icarus Verilog / Verilator | опционально |
 | Yosys synthesis/stat pass | опционально |
 | интерактивная HTML-визуализация схемы | есть |
+
+Float frontend сохраняет dtype модели: поддержаны `torch.float32` и
+`torch.float64`. Параметры других floating/complex dtype, смешанные dtype,
+module/global hooks, custom metaclass и переопределённая семантика стандартных
+модулей, call path любого вложенного модуля, class-level/external Python state,
+custom copy/decorator/introspection path, nested code и состояние, изменяемое во
+время trace, отклоняются до FX lowering. После lowering контрольный forward точно
+сверяется с GraphIR на нулевом и детерминированном ненулевом входах. Custom
+Python conditional/loop/exception control flow и Proxy-dependent formatting
+отклоняются до trace. Float reference использует PyTorch kernels, чтобы не
+менять класс около float32 cancellation/tie.
+
+Параметры и buffers должны быть обычными CPU tensors с layout `strided`,
+contiguous storage, точным типом `Parameter`/`Tensor` и обычными string-именами в
+registries; tensor subclasses, negative/conjugate view bits, сохранённый `.grad`,
+произвольное tensor/ndarray instance-state и monkeypatch используемых PyTorch API
+не входят в контракт.
+
+Статическая input shape задаётся конечным `Sequence`: ранг ≤ 64, размеры —
+положительные built-in `int`, всего ≤ 1 000 000 элементов. Тот же лимит действует
+для output `Conv2d`; его kernel/stride/padding и координатная арифметика должны
+помещаться в signed 32-bit SystemVerilog `int`.
 
 Пример модели, которая хорошо ложится в текущий flow:
 
@@ -80,9 +104,24 @@ class TinyMLP(nn.Module):
 
 - динамический control flow;
 - неизвестные формы тензоров;
-- batch inference;
+- input rank > 64 или input/Conv2d output > 1 000 000 элементов;
+- batch/prefix dimensions для `Linear` и batch для `Conv2d`;
+- ветвления, skip-connections, несколько входов/выходов и произвольный FX DAG;
+- частичный `Flatten` и параметризованный `argmax(dim=...)`;
+- module/global hooks, subclasses, custom metaclasses и instance-level
+  `forward`/call overrides;
+- custom attribute/call/copy descriptors, decorated `forward`, переопределённые
+  `named_*`/module-introspection API, nested code objects, class-level или внешнее
+  изменяемое Python state и мутация состояния модели во время FX trace/semantic
+  probe;
+- `ReLU(inplace=True)` и другие немоделируемые побочные эффекты;
+- dtype параметров/buffers кроме однородного `float32` или `float64`;
+- non-CPU, non-strided, non-contiguous tensors, tensor subclasses,
+  negative/conjugate views, сохранённый `.grad`, неточные registry names и прямое
+  tensor/ndarray-состояние модуля вне стандартных registries;
 - training graph, autograd и GPU-логика;
 - grouped/depthwise convolution, dilation;
+- Conv2d structural/index values вне signed 32-bit SystemVerilog `int`;
 - normalization, attention и большие современные архитектуры;
 - production timing closure.
 
@@ -91,7 +130,8 @@ class TinyMLP(nn.Module):
 
 ## Установка
 
-Нужен Python `3.11+`. Самый удобный путь - через `uv`:
+Для v0.2 поддерживается только Python `>=3.12,<3.13`. Python 3.11 и 3.13 в
+release-контракт не входят. Самый удобный путь - через `uv`:
 
 ```bash
 uv --cache-dir temp/uv-cache sync --dev
@@ -99,6 +139,8 @@ uv --cache-dir temp/uv-cache sync --dev
 
 Почему указан `--cache-dir`: на Windows и в ограниченных окружениях стандартный
 кеш `uv` иногда лежит вне рабочей папки. Такой вариант проще воспроизводить.
+Собранный wheel включает модели встроенных demo, поэтому установленная команда
+`torch2rtl demo --name tiny-conv` не требует каталога `examples/` из checkout.
 
 ## Быстрый старт
 
@@ -166,8 +208,22 @@ uv --cache-dir temp/uv-cache run torch2rtl verify build
 
 Команда ищет доступный симулятор. Если есть `iverilog` + `vvp`, запускается
 сгенерированный testbench. Если Icarus Verilog нет, но есть `verilator`, будет
-попытка запуска через Verilator. Если симуляторов нет, команда аккуратно
-сообщит `simulator not found` и завершится без падения.
+попытка запуска через Verilator. Явная команда `verify` возвращает ненулевой код,
+если симулятор не найден. Только объединённая команда `demo` может явно показать
+этот необязательный этап как `skipped`.
+
+Перед `verify` и `synth` проверяются структура `report.json`, обязательная
+contract metadata, канонический testbench и локальные SHA-256 generated RTL.
+Одиночное несогласованное повреждение проверяемого RTL/testbench/vector/report
+контракта приводит к failure до EDA либо к bit-exact failure симуляции. SHA-256
+гарантированно связывает только RTL sources; проверки vectors охватывают их
+структуру, диапазоны и соответствие ожидаемым результатам, а report —
+обязательную metadata. Произвольное допустимое изменение vector payload, не
+меняющее результат, или несвязанного report-поля обнаруживать не гарантируется.
+Manifest находится в том же build directory и не является внешним корнем
+доверия: согласованная злонамеренная замена RTL, vectors, report и их хешей
+одновременно находится вне threat model. Для такой защиты нужна внешняя подпись,
+доверенный manifest либо полная регенерация из доверенных исходников.
 
 ## Synthesis report
 
@@ -176,7 +232,8 @@ uv --cache-dir temp/uv-cache run torch2rtl synth build
 ```
 
 Если установлен `yosys`, команда делает простой synthesis/stat pass и пишет
-`build/yosys.log`. Если `yosys` не найден, проект честно сообщает об этом.
+`build/yosys.log`. Если `yosys` не найден, явная команда `synth` сообщает об
+этом и возвращает ненулевой код; `demo` может оставить этап опциональным.
 
 ## Готовые примеры
 
@@ -187,7 +244,8 @@ uv --cache-dir temp/uv-cache run torch2rtl synth build
 
 ```bash
 uv --cache-dir temp/uv-cache run python examples/tiny_mlp/train.py --epochs 30
-uv --cache-dir temp/uv-cache run python examples/tiny_mlp/compile.py --out build
+uv --cache-dir temp/uv-cache run python examples/tiny_mlp/compile.py \
+  --checkpoint examples/tiny_mlp/tiny_mlp.pt --out build
 ```
 
 ### Grid Classifier
@@ -196,7 +254,7 @@ Compile-only пример для сетки `4x4`:
 
 ```text
 Flatten(4x4) -> Linear(16, 8) -> ReLU -> Linear(8, 8)
--> ReLU -> Linear(8, 4) -> Argmax
+-> ReLU -> Linear(8, 4) -> derived RTL class_id
 ```
 
 ```bash
@@ -214,7 +272,7 @@ uv --cache-dir temp/uv-cache run torch2rtl compile examples/grid_classifier/mode
 Мини-пайплайн для проверки `Conv2d`:
 
 ```text
-Conv2d(1x3x3 -> 1x2x2) -> ReLU -> Flatten -> Linear(4, 4) -> Argmax
+Conv2d(1x3x3 -> 1x2x2) -> ReLU -> Flatten -> Linear(4, 4)
 ```
 
 ```bash
@@ -233,7 +291,7 @@ End-to-end демо: обучает маленькую CNN на детермин
 изображениях `4x4`, сохраняет checkpoint и компилирует веса в RTL.
 
 ```text
-Conv2d(1 -> 4) -> ReLU -> Flatten -> Linear(64, 4) -> Argmax
+Conv2d(1 -> 4) -> ReLU -> Flatten -> Linear(64, 4)
 ```
 
 ```bash
@@ -276,10 +334,10 @@ uv --cache-dir temp/uv-cache run torch2rtl visualize build --vector-index 0
 | Флаг | Что делает |
 | --- | --- |
 | `--input-shape` | форма входа без batch dimension |
-| `--bits` | ширина fixed-point числа, по умолчанию `8` |
-| `--frac-bits` | число дробных битов, по умолчанию `6` |
-| `--acc-bits` | ширина аккумулятора, по умолчанию `32` |
-| `--vectors` | сколько тестовых векторов сгенерировать |
+| `--bits` | signed data width, `2..32`, по умолчанию `8` |
+| `--frac-bits` | дробная ширина, `0 <= frac_bits < bits`, по умолчанию `6` |
+| `--acc-bits` | аккумулятор, `bits < acc_bits <= 64`, по умолчанию `32` |
+| `--vectors` | положительное число тестовых векторов |
 | `--seed` | seed для воспроизводимых векторов |
 | `--out` | папка для RTL и отчетов |
 
@@ -290,7 +348,7 @@ torch2rtl/
   frontend/pytorch_fx.py        # PyTorch -> torch.fx -> GraphIR
   ir/                           # dataclass-IR для tensors, ops и graph
   quant/fixed_point.py          # fixed-point config и saturation helpers
-  quant/reference.py            # Python reference без PyTorch
+  quant/reference.py            # fixed reference + dtype-faithful PyTorch float reference
   backend/systemverilog/        # Jinja2 templates и RTL emitter
   verify/                       # vectors, simulator discovery, compare
   synth/                        # Yosys integration
@@ -316,8 +374,11 @@ uv --cache-dir temp/uv-cache run pytest -q
 
 Тесты покрывают:
 
-- fixed-point saturation и ручную арифметику;
-- PyTorch FX parsing;
+- fixed-point rounding, saturation, границы и достаточность `ACC_BITS`;
+- PyTorch FX parsing, реальные зависимости и настоящий `output`;
+- PyTorch float против GraphIR float по промежуточным слоям;
+- Python fixed-point против RTL bit-exact на directed boundary vectors;
+- оба формата Yosys stat, включая `Number of cells: 115`;
 - SystemVerilog generation;
 - Conv2d lowering;
 - примеры из `examples/`;
@@ -327,8 +388,8 @@ uv --cache-dir temp/uv-cache run pytest -q
 ## Roadmap
 
 - `v0.1`: Linear / ReLU / Flatten / Argmax.
-- `v0.2`: Conv2d vertical slice.
-- `v0.3`: board-free demo flow.
+- `v0.2`: Semantic Correctness и воспроизводимый board-free release gate.
+- `v0.3`: проверка accuracy обученной CNN по цепочке float → fixed → RTL.
 - `v0.4`: sequential MAC backend.
 - `v0.5`: streaming interface / AXI-like interface.
 

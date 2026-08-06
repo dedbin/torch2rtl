@@ -7,7 +7,7 @@ name = "torch2rtl"
 version = "0.2.0"
 description = "Minimal PyTorch FX to fixed-point SystemVerilog compiler flow."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 license = { text = "MIT" }
 authors = [
   { name = "torch2rtl contributors" },
@@ -39,7 +39,13 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = ["--basetemp=temp/pytest"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["torch2rtl"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"examples/tiny_mlp/model.py" = "examples/tiny_mlp/model.py"
+"examples/grid_classifier/model.py" = "examples/grid_classifier/model.py"
+"examples/tiny_conv/model.py" = "examples/tiny_conv/model.py"
+"examples/image_cnn/model.py" = "examples/image_cnn/model.py"
+"examples/image_cnn/data.py" = "examples/image_cnn/data.py"

@@ -73,7 +73,11 @@ def main() -> int:
         if args.keep_tex:
             shutil.copy2(tex_path, out_path.with_suffix(".tex"))
 
-    print(f"wrote {out_path.relative_to(ROOT)}")
+    try:
+        display_path = out_path.relative_to(ROOT)
+    except ValueError:
+        display_path = out_path
+    print(f"wrote {display_path}")
     return 0
 
 
@@ -124,7 +128,7 @@ def render_latex(title: str, markdown: str) -> str:
 \titlespacing*{{\subsection}}{{0pt}}{{0.9em}}{{0.35em}}
 \title{{{escape_latex(title)}}}
 \author{{Подготовлено по текущему состоянию репозитория}}
-\date{{15 июля 2026}}
+\date{{5 августа 2026}}
 \begin{{document}}
 \begin{{titlepage}}
 \centering
@@ -137,7 +141,7 @@ def render_latex(title: str, markdown: str) -> str:
 {{\large Итоговый файл: \texttt{{docs/torch2rtl\_guide.pdf}}\par}}
 \vfill
 {{\large Подготовлено по текущему состоянию репозитория\par}}
-{{\large 15 июля 2026\par}}
+{{\large 5 августа 2026\par}}
 \end{{titlepage}}
 \tableofcontents
 \clearpage

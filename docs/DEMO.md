@@ -15,22 +15,26 @@ uv --cache-dir temp/uv-cache run torch2rtl demo --name tiny-conv --out build/dem
 Покажите `examples/tiny_conv/model.py`. Модель принимает тензор формы `(1, 3, 3)` и проходит через:
 
 ```text
-Conv2d -> ReLU -> Flatten -> Linear -> Argmax
+Conv2d -> ReLU -> Flatten -> Linear
 ```
 
 Веса заданы вручную, поэтому пример воспроизводимый и не требует обучения.
 
 ## 3. Разбор через torch.fx
 
-Откройте `torch2rtl/frontend/pytorch_fx.py`. Функция `parse_model` вызывает `torch.fx.symbolic_trace`, идет по узлам графа и поддерживает только явные операции: `Linear`, `ReLU`, `Flatten`, `Conv2d` и `argmax`. Неподдержанный узел приводит к `UnsupportedOpError`.
+Откройте `torch2rtl/frontend/pytorch_fx.py`. Функция `parse_model` вызывает `torch.fx.symbolic_trace`, проверяет одну последовательную цепочку реальных зависимостей и настоящий `output`. Поддержаны module-вызовы `Linear`, `ReLU`, полный `Flatten`, `Conv2d` и финальный глобальный `argmax`. Неподдержанный узел или семантика приводит к `UnsupportedOpError` до RTL.
 
 ## 4. Внутреннее представление GraphIR
 
 Покажите `torch2rtl/ir/graph.py`, `torch2rtl/ir/ops.py` и `torch2rtl/ir/tensor.py`. `GraphIR` хранит входной тензор, выходной тензор и последовательность операций. Для `tiny-conv` в `report.json` должны быть операции:
 
 ```text
-Conv2dIR, ReluIR, FlattenIR, LinearIR, ArgmaxIR
+Conv2dIR, ReluIR, FlattenIR, LinearIR
 ```
+
+Модель `tiny-conv` возвращает логиты, поэтому семантический GraphIR тоже
+заканчивается логитами. Блок Argmax появляется позже как дополнительный
+hardware-выход `class_id`; порт `logits` остаётся доступен и проверяется bit-exact.
 
 ## 5. Фиксированная точка
 
@@ -64,7 +68,9 @@ build/demo/tb_top.sv
 `input_vectors.txt` содержит квантованные входы, `expected_classes.txt` — ожидаемые
 классы, а `expected_logits.txt` — все выходные значения фиксированно-точечной
 эталонной модели. `tb_top.sv` читает эти файлы и побитово сравнивает с эталоном
-как `class_id`, так и каждый signed logit.
+как `class_id`, так и каждый signed logit. Ожидаемое положительное число
+векторов зашито в testbench; все три файла должны содержать ровно ожидаемое
+число значений. Поэтому пустой или укороченный набор не может дать `PASS`.
 
 ## 8. Моделирование
 
@@ -114,7 +120,27 @@ HTML, поэтому все переходы работают и при откр
 
 - поддержан небольшой поднабор PyTorch;
 - входные формы должны быть статическими;
+- input rank ≤ 64, input/Conv2d output содержат не более 1 000 000 элементов;
+- поддерживается одна последовательная цепочка, не произвольный DAG;
+- `Linear` принимает только один вектор, `Flatten` должен быть полным;
+- explicit `argmax` поддержан только глобально без `keepdim`;
+- поддержаны только однородные float-модели `float32` и `float64`;
+- module/global hooks, custom metaclasses, переопределённые
+  leaf/call/introspection API, custom copy protocol и decorated `forward`
+  отклоняются;
+- custom Python bytecode вне закрытого подмножества, nested code objects,
+  conditions/loops/exception handling и Proxy-dependent formatting не входят в
+  последовательный FX-контракт;
+- class-level/external Python state и изменение module-owned state во время FX
+  trace или concrete semantic probe отклоняются;
+- параметры/buffers должны быть обычными contiguous CPU tensors без subclasses,
+  negative/conjugate view bits и сохранённого `.grad`; неточные registry names,
+  прямое tensor/ndarray instance-state и доступ custom `forward` к внутренним
+  module registries не поддержаны;
+- `ReLU(inplace=True)` не поддержан из-за немоделируемой мутации входа;
 - пакетная размерность для `Conv2d` не поддержана;
+- structural/index arithmetic `Conv2d` должна помещаться в signed 32-bit
+  SystemVerilog `int`;
 - нет обучения, autograd и GPU-логики в компиляторе;
 - нет нормализации, attention и больших архитектур;
 - RTL сейчас в основном комбинационный;

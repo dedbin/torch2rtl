@@ -120,8 +120,12 @@ def _trace_vector_payload(
             details = {"reshape": "flat"}
             hardware = None
         elif isinstance(op, QuantizedArgmaxIR):
-            class_id = int(np.argmax(logits))
-            details = {"winner_index": class_id, "winner_value": int(logits[class_id])}
+            flat_logits = np.asarray(logits, dtype=np.int64).reshape(-1)
+            class_id = int(np.argmax(flat_logits))
+            details = {
+                "winner_index": class_id,
+                "winner_value": int(flat_logits[class_id]),
+            }
             hardware = None
         else:
             raise TypeError(f"Unsupported quantized op for trace: {type(op).__name__}")
@@ -480,14 +484,12 @@ def _validate_vector_index(inputs: np.ndarray, vector_index: int) -> None:
 
 def _load_input_vectors(path: Path, input_size: int) -> np.ndarray:
     values = np.loadtxt(path, dtype=np.int64)
-    data = np.asarray(values, dtype=np.int64)
-    if data.ndim == 0:
-        return data.reshape(1, 1)
-    if data.ndim == 1:
-        if input_size == 1:
-            return data.reshape(-1, 1)
-        return data.reshape(1, input_size)
-    return data
+    data = np.asarray(values, dtype=np.int64).reshape(-1)
+    if data.size % input_size != 0:
+        raise ValueError(
+            f"input vector value count {data.size} is not divisible by {input_size}"
+        )
+    return data.reshape(-1, input_size)
 
 
 def _load_expected_classes(path: Path) -> np.ndarray:

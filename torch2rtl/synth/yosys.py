@@ -9,7 +9,8 @@ from string import ascii_uppercase
 from typing import Any
 
 from torch2rtl.eda_tools import find_eda_tool
-from torch2rtl.synth.report import update_report
+from torch2rtl.synth.report import record_preflight_failure, update_report
+from torch2rtl.verify.source_integrity import validate_build_rtl_sources
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,14 @@ def run_yosys(build_dir: Path) -> SynthResult:
     build_dir = build_dir.resolve()
     if not build_dir.exists():
         return SynthResult(False, "error", f"build directory not found: {build_dir}")
+    integrity_error = validate_build_rtl_sources(build_dir)
+    if integrity_error is not None:
+        result = SynthResult(False, "invalid_sources", integrity_error)
+        try:
+            update_report(build_dir, "synthesis", result.__dict__)
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            record_preflight_failure(build_dir, "synthesis", result.__dict__)
+        return result
     yosys = find_eda_tool("yosys")
     if yosys is None:
         result = SynthResult(
@@ -72,19 +81,36 @@ def parse_yosys_metrics(text: str) -> dict[str, Any]:
     section = _last_design_hierarchy_section(text)
     metrics: dict[str, Any] = {}
     cell_types: dict[str, int] = {}
+    saw_cell_count = False
 
     for line in section.splitlines():
         stripped = line.strip()
-        match = re.fullmatch(r"(-|\d+)\s+(.+)", stripped)
-        if match is None:
-            continue
-        count = _yosys_count(match.group(1))
-        label = match.group(2).strip()
+        resource_match = re.fullmatch(
+            r"Number of (.+?):\s+(-|\d+)",
+            stripped,
+        )
+        if resource_match is not None:
+            label = resource_match.group(1).strip()
+            count = _yosys_count(resource_match.group(2))
+        else:
+            count_first_match = re.fullmatch(r"(-|\d+)\s+(.+)", stripped)
+            if count_first_match is None:
+                if saw_cell_count:
+                    cell_match = re.fullmatch(r"(\$\S+)\s+(-|\d+)", stripped)
+                    if cell_match is not None:
+                        cell_types[cell_match.group(1)] = _yosys_count(
+                            cell_match.group(2)
+                        )
+                continue
+            count = _yosys_count(count_first_match.group(1))
+            label = count_first_match.group(2).strip()
         metric_name = RESOURCE_LABELS.get(label)
         if metric_name is not None:
             metrics[metric_name] = count
+            if metric_name == "cells":
+                saw_cell_count = True
             continue
-        if label.startswith("$"):
+        if saw_cell_count and label.startswith("$"):
             cell_types[label] = count
 
     if cell_types:

@@ -13,6 +13,7 @@ from torch2rtl.quant.reference import (
     conv2d_fixed,
     infer_quantized,
     linear_fixed,
+    validate_accumulator_width,
 )
 
 
@@ -45,6 +46,35 @@ def test_python_reference_inference_returns_stable_class() -> None:
     )
     result = infer_quantized(qgraph, np.asarray([1, 3], dtype=np.int64))
     assert result.class_id == 1
+    assert [activation.name for activation in result.activations] == [
+        "linear0",
+        "relu",
+        "argmax",
+    ]
+    np.testing.assert_array_equal(result.activations[0].values, [1, 3])
+    np.testing.assert_array_equal(result.activations[-1].values, 1)
+
+
+def test_quantized_reference_derives_class_without_explicit_argmax() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=2, acc_bits=32)
+    qgraph = QuantizedGraph(
+        input_shape=(2,),
+        cfg=cfg,
+        ops=(
+            QuantizedLinearIR(
+                name="linear0",
+                in_features=2,
+                out_features=2,
+                weight=np.asarray([[4, 0], [0, 4]], dtype=np.int64),
+                bias=np.asarray([0, 0], dtype=np.int64),
+            ),
+        ),
+    )
+
+    result = infer_quantized(qgraph, np.asarray([1, 3], dtype=np.int64))
+
+    assert result.class_id == 1
+    assert [activation.name for activation in result.activations] == ["linear0"]
 
 
 def test_fixed_point_conv2d_matches_manual_calculation() -> None:
@@ -186,3 +216,84 @@ def test_linear_fixed_saturates_output_at_signed_int8_boundaries() -> None:
     cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=18)
     output = linear_fixed(inputs, weight, bias, cfg)
     np.testing.assert_array_equal(output, expected)
+
+
+def test_accumulator_width_validation_rejects_possible_linear_wraparound() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=14)
+    qgraph = QuantizedGraph(
+        input_shape=(1,),
+        cfg=cfg,
+        ops=(
+            QuantizedLinearIR(
+                name="unsafe_linear",
+                in_features=1,
+                out_features=1,
+                weight=np.asarray([[127]], dtype=np.int64),
+                bias=np.asarray([0], dtype=np.int64),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        OverflowError,
+        match=r"ACC_BITS=14.*unsafe_linear.*requires at least 15",
+    ):
+        validate_accumulator_width(qgraph)
+
+
+def test_accumulator_width_validation_accepts_exact_linear_boundary() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=15)
+    qgraph = QuantizedGraph(
+        input_shape=(1,),
+        cfg=cfg,
+        ops=(
+            QuantizedLinearIR(
+                name="safe_linear",
+                in_features=1,
+                out_features=1,
+                weight=np.asarray([[127]], dtype=np.int64),
+                bias=np.asarray([0], dtype=np.int64),
+            ),
+        ),
+    )
+
+    validate_accumulator_width(qgraph)
+
+
+def test_accumulator_width_validation_checks_conv_mac_prefixes() -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=15)
+    op = QuantizedConv2dIR(
+        name="unsafe_conv",
+        in_channels=1,
+        out_channels=1,
+        input_height=1,
+        input_width=2,
+        output_height=1,
+        output_width=1,
+        kernel_height=1,
+        kernel_width=2,
+        stride=(1, 1),
+        padding=(0, 0),
+        weight=np.asarray([[[[127, 127]]]], dtype=np.int64),
+        bias=np.asarray([0], dtype=np.int64),
+    )
+    qgraph = QuantizedGraph(input_shape=(1, 1, 2), cfg=cfg, ops=(op,))
+
+    with pytest.raises(
+        OverflowError,
+        match=r"unsafe_conv.*MAC prefix 2.*requires at least 16",
+    ):
+        validate_accumulator_width(qgraph)
+
+
+@pytest.mark.parametrize("value", [-129, 128])
+def test_fixed_reference_rejects_values_outside_data_width(value: int) -> None:
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=16)
+
+    with pytest.raises(OverflowError, match="Linear input.*signed 8-bit"):
+        linear_fixed(
+            np.asarray([value], dtype=np.int64),
+            np.asarray([[1]], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+            cfg,
+        )

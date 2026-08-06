@@ -3,11 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
+import torch
 import torch.nn as nn
 
 from torch2rtl.backend.systemverilog.emit import emit_systemverilog
 from torch2rtl.frontend.pytorch_fx import parse_model
 from torch2rtl.quant.fixed_point import FixedPointConfig
+from torch2rtl.quant.reference import infer_quantized, quantize_graph
+from torch2rtl.verify.simulator import run_simulation
 
 
 def test_generated_sv_contains_expected_module_names(tmp_path: Path) -> None:
@@ -40,8 +44,9 @@ def test_generated_sv_contains_expected_module_names(tmp_path: Path) -> None:
     tb_top = (tmp_path / "tb_top.sv").read_text(encoding="utf-8")
     assert '$fopen("expected_logits.txt", "r")' in tb_top
     assert "actual_logit !== expected_logit" in tb_top
-    assert 'while ($fscanf(fd_expected, "%d", expected_class) == 1)' in tb_top
-    assert "while (!$feof" not in tb_top
+    assert "localparam int EXPECTED_VECTORS = 2" in tb_top
+    assert "vector_idx < EXPECTED_VECTORS" in tb_top
+    assert "extra or malformed expected logit data" in tb_top
 
 
 def test_generated_sv_contains_conv2d_backend(tmp_path: Path) -> None:
@@ -87,3 +92,71 @@ def test_emit_systemverilog_removes_stale_generated_artifacts(tmp_path: Path) ->
     assert not (tmp_path / "old_weights.mem").exists()
     assert not (tmp_path / "old_bias.mem").exists()
     assert not (tmp_path / "simv").exists()
+
+
+def test_emit_rejects_unsafe_accumulator_before_writing_rtl(tmp_path: Path) -> None:
+    model = nn.Sequential(nn.Linear(1, 1, bias=False))
+    with torch.no_grad():
+        model[0].weight.fill_(127 / 64)
+    graph = parse_model(model, input_shape=(1,))
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=14)
+
+    with pytest.raises(OverflowError, match="requires at least 15"):
+        emit_systemverilog(graph, cfg, tmp_path, vector_count=1, seed=0)
+
+    assert not (tmp_path / "top.sv").exists()
+
+
+def test_generated_rtl_matches_python_on_directed_boundary_vectors(
+    tmp_path: Path,
+) -> None:
+    model = nn.Sequential(nn.Linear(2, 3, bias=False))
+    with torch.no_grad():
+        model[0].weight.copy_(
+            torch.tensor(
+                [
+                    [127 / 64, 127 / 64],
+                    [127 / 64, -127 / 64],
+                    [-127 / 64, 127 / 64],
+                ]
+            )
+        )
+    graph = parse_model(model, input_shape=(2,))
+    cfg = FixedPointConfig(bits=8, frac_bits=6, acc_bits=16)
+    emit_systemverilog(graph, cfg, tmp_path, vector_count=6, seed=0)
+    qgraph = quantize_graph(graph, cfg)
+    inputs = np.asarray(
+        [
+            [127, 127],
+            [-128, -128],
+            [127, -128],
+            [-128, 127],
+            [0, 0],
+            [1, -1],
+        ],
+        dtype=np.int64,
+    )
+    results = [infer_quantized(qgraph, row) for row in inputs]
+    expected_logits = np.asarray([result.logits for result in results], dtype=np.int64)
+    expected_classes = np.asarray(
+        [result.class_id for result in results],
+        dtype=np.int64,
+    )
+    np.savetxt(tmp_path / "input_vectors.txt", inputs, fmt="%d")
+    np.savetxt(
+        tmp_path / "expected_logits.txt",
+        expected_logits,
+        fmt="%d",
+    )
+    np.savetxt(
+        tmp_path / "expected_classes.txt",
+        expected_classes.reshape(-1, 1),
+        fmt="%d",
+    )
+
+    simulation = run_simulation(tmp_path)
+
+    assert simulation.ok, simulation.stdout + simulation.stderr
+    assert "PASS vectors=6" in simulation.stdout
+    assert np.any(expected_logits == cfg.min_int)
+    assert np.any(expected_logits == cfg.max_int)

@@ -85,6 +85,53 @@ def render_visualization_from_build(
     return output
 
 
+def refresh_visualization_report_status(build_dir: Path) -> Path | None:
+    """Refresh report status without reading vector data or rebuilding a trace."""
+    manifest_path = build_dir / MANIFEST_NAME
+    if not manifest_path.exists():
+        return None
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selected_index = int(manifest.get("vectors", {}).get("selected_index", 0))
+    empty_summary = {
+        "shape": [],
+        "size": 0,
+        "preview": [],
+        "values": [],
+        "min": 0,
+        "max": 0,
+        "mean": 0.0,
+        "nonzero": 0,
+    }
+    unavailable_trace = {
+        "vector_index": selected_index,
+        "input": empty_summary,
+        "steps": [],
+        "logits": empty_summary,
+        "class_id": None,
+        "expected_class": None,
+        "matched": False,
+    }
+    manifest["trace"] = unavailable_trace
+    manifest["traces"] = {
+        "selected_index": selected_index,
+        "total_count": 0,
+        "included_count": 1,
+        "limit": 0,
+        "truncated": False,
+        "included_indices": [selected_index],
+        "traces": [unavailable_trace],
+    }
+    manifest["build"] = _build_payload(
+        build_dir=build_dir,
+        generated_files=manifest.get("build", {}).get("generated_files", []),
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    html_path = build_dir / HTML_NAME
+    html_path.write_text(render_visualization_html(manifest), encoding="utf-8")
+    return html_path
+
+
 def build_visualization_manifest(
     graph: GraphIR,
     qgraph: QuantizedGraph,
