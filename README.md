@@ -51,6 +51,7 @@ flowchart LR
 | signed int8 fixed-point по умолчанию | есть |
 | combinational SystemVerilog backend | есть |
 | Python fixed-point reference | есть |
+| независимый dependency-free C11 fixed-point oracle | есть |
 | пользовательские quantized verification-векторы с provenance | есть |
 | RTL simulation через Icarus Verilog / Verilator | опционально |
 | Yosys synthesis/stat pass | опционально |
@@ -434,18 +435,19 @@ uv --cache-dir temp/uv-cache run pytest -q
 - `v0.4`: sequential MAC backend.
 - `v0.5`: streaming interface / AXI-like interface.
 
-### Отложенные идеи без срока
+### Независимый C reference
 
-- [ ] Добавить независимую эталонную реализацию вычислений с фиксированной
-  точкой на C++ для операций `Linear`, `Conv2d`, `ReLU`, `Flatten` и `Argmax`.
-  Сначала она должна принимать уже квантованные целые входы и веса, точно
-  воспроизводить правила накопления, арифметического сдвига, возврата к
-  исходному масштабу и ограничения допустимым диапазоном. Затем нужно сверять
-  промежуточные тензоры, выходы сети и `class_id` между эталонами на Python и
-  C++, а также сгенерированной схемой. Все целочисленные значения должны
-  совпадать. Такая реализация даст дополнительную независимую проверку
-  корректности и, возможно, ускорит оценку точности на всём наборе данных. Это
-  не новый способ генерации схемы для ПЛИС.
+Каталог [`c_reference/`](c_reference/) содержит dependency-free C11-реализацию
+fixed-point операций `Linear`, unbatched `Conv2d`, `ReLU`, `Flatten` и
+глобального first-maximum `Argmax`. Она принимает уже квантованные `int64_t`,
+проверяет конфигурацию, размеры, диапазоны значений и каждый MAC-prefix и служит
+независимым bit-exact oracle для Python reference и RTL.
+
+Это библиотека отдельных kernels, а не graph runtime, Python production binding,
+RTL/HLS backend или FPGA-flow. Ускорение inference не заявляется: производительность
+будет оцениваться отдельно только после correctness и sanitizer gates. Точный API,
+layouts, правила bias/aliasing и команды проверки описаны в
+[`c_reference/README.md`](c_reference/README.md).
 
 ## Лицензия
 
