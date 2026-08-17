@@ -293,15 +293,22 @@ def _report_payload(
     vector_count: int,
     vector_source: str,
 ) -> dict[str, Any]:
+    graph_payload: dict[str, Any] = {
+        "input_shape": list(graph.input.shape),
+        "output_shape": list(graph.output.shape),
+        "ops": [type(op).__name__ for op in graph.ops],
+    }
+    if "input_adapter" in graph.metadata:
+        graph_payload["input_adapter"] = dict(graph.metadata["input_adapter"])
+    if "transformations" in graph.metadata:
+        graph_payload["transformations"] = [
+            dict(record) for record in graph.metadata["transformations"]
+        ]
     return {
         "tool": "torch2rtl",
         "version": "0.2.0",
         "quant": asdict(cfg),
-        "graph": {
-            "input_shape": list(graph.input.shape),
-            "output_shape": list(graph.output.shape),
-            "ops": [type(op).__name__ for op in graph.ops],
-        },
+        "graph": graph_payload,
         "metrics": _metrics_payload(qgraph),
         "reference": _reference_payload(
             graph,

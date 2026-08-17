@@ -128,7 +128,7 @@ def render_latex(title: str, markdown: str) -> str:
 \titlespacing*{{\subsection}}{{0pt}}{{0.9em}}{{0.35em}}
 \title{{{escape_latex(title)}}}
 \author{{Подготовлено по текущему состоянию репозитория}}
-\date{{5 августа 2026}}
+\date{{17 августа 2026}}
 \begin{{document}}
 \begin{{titlepage}}
 \centering
@@ -141,7 +141,7 @@ def render_latex(title: str, markdown: str) -> str:
 {{\large Итоговый файл: \texttt{{docs/torch2rtl\_guide.pdf}}\par}}
 \vfill
 {{\large Подготовлено по текущему состоянию репозитория\par}}
-{{\large 5 августа 2026\par}}
+{{\large 17 августа 2026\par}}
 \end{{titlepage}}
 \tableofcontents
 \clearpage

@@ -24,6 +24,27 @@ Conv2d -> ReLU -> Flatten -> Linear
 
 Откройте `torch2rtl/frontend/pytorch_fx.py`. Функция `parse_model` вызывает `torch.fx.symbolic_trace`, проверяет одну последовательную цепочку реальных зависимостей и настоящий `output`. Поддержаны module-вызовы `Linear`, `ReLU`, полный `Flatten`, `Conv2d` и финальный глобальный `argmax`. Неподдержанный узел или семантика приводит к `UnsupportedOpError` до RTL.
 
+Frontend поддерживает точную соседнюю пару
+`nn.Conv2d -> nn.BatchNorm2d`. Модель уже должна находиться в режиме `eval`.
+`parse_model()` автоматически создает новый `Conv2d`, поэтому `BatchNorm2d` не
+попадает в GraphIR и RTL. Вручную вызывать
+`torch.nn.utils.fusion.fuse_conv_bn_eval()` не нужно.
+Публичный вход остается CHW; пакет размера `N=1` используется только при
+сравнении исходной модели с FX GraphModule после fusion. Исходная модель не
+изменяется. Список преобразованных пар записывается в
+`graph.metadata["transformations"]` и `report.json`.
+
+Поддерживаются `Conv2d(bias=True/False)` и
+`BatchNorm2d(affine=True/False)`. При `affine=True` `weight` должен иметь точный
+тип `nn.Parameter`. `bias` может быть `None` только в версии PyTorch, чей
+конструктор принимает `bias=False`; в остальных случаях `bias` должен иметь
+точный тип `nn.Parameter`. При `affine=False` оба слота должны быть `None`.
+`eps` должен иметь точный встроенный тип `float` и конечное неотрицательное
+значение. Нулевой `eps` разрешен, если выражение `running_var + eps` имеет
+конечное положительное значение в каждом канале. Отрицательный `eps` отклоняется
+до fusion. Если близкие логиты меняют итоговый `argmax`, frontend отклоняет
+модель независимо от допуска численного сравнения.
+
 ## 4. Внутреннее представление GraphIR
 
 Покажите `torch2rtl/ir/graph.py`, `torch2rtl/ir/ops.py` и `torch2rtl/ir/tensor.py`. `GraphIR` хранит входной тензор, выходной тензор и последовательность операций. Для `tiny-conv` в `report.json` должны быть операции:
@@ -123,6 +144,16 @@ HTML, поэтому все переходы работают и при откр
 - input rank ≤ 64, input/Conv2d output содержат не более 1 000 000 элементов;
 - поддерживается одна последовательная цепочка, не произвольный DAG;
 - `Linear` принимает только один вектор, `Flatten` должен быть полным;
+- `BatchNorm2d` поддержан только в точной паре после `Conv2d`, в `eval`, с
+  накопленной статистикой и без fan-out; `BatchNorm1d`, `BatchNorm3d` и
+  `BatchNorm2d` вне пары не поддержаны;
+- отдельный `BatchNorm2d(..., bias=False)` зависит от API установленной версии
+  PyTorch; `eps` должен иметь точный встроенный тип `float` и конечное
+  неотрицательное значение, а `running_var + eps` должно иметь конечное
+  положительное значение в каждом канале;
+- после fusion `Flatten` разрешен только при структурном совпадении исходной
+  формы NCHW и формы CHW после fusion. После применения `Flatten` должно
+  выполняться `source_flatten_shape == (1, *fused_flatten_shape)`;
 - explicit `argmax` поддержан только глобально без `keepdim`;
 - поддержаны только однородные float-модели `float32` и `float64`;
 - module/global hooks, custom metaclasses, переопределённые
@@ -142,7 +173,7 @@ HTML, поэтому все переходы работают и при откр
 - structural/index arithmetic `Conv2d` должна помещаться в signed 32-bit
   SystemVerilog `int`;
 - нет обучения, autograd и GPU-логики в компиляторе;
-- нет нормализации, attention и больших архитектур;
+- нет других операций нормализации, attention и больших архитектур;
 - RTL сейчас в основном комбинационный;
 - Yosys-запуск является простым `read_verilog`, `prep -top top`, `stat`, а не полным маршрутом до платы.
 

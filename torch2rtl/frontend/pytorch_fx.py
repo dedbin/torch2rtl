@@ -24,26 +24,58 @@ from torch2rtl.ir.tensor import TensorIR
 _MAX_TENSOR_ELEMENTS = 1_000_000
 _MAX_TENSOR_RANK = 64
 _SV_INT_MAX = (1 << 31) - 1
+# Bootstrap must not resolve these names through mutable builtins or a mutable
+# frontend alias before the builtins integrity check has completed.
+_TRUSTED_TYPE = type
+_TRUSTED_DICT_TYPE = dict
+_TRUSTED_STR_TYPE = str
+_TRUSTED_CODE_TYPE = CodeType
+_TRUSTED_FUNCTION_TYPE = FunctionType
+_TRUSTED_MODULE_TYPE = ModuleType
+_TRUSTED_MODULE_GETATTRIBUTE = ModuleType.__getattribute__
+_TRUSTED_FRONTEND_GLOBALS = globals()
+
+
+def _require_exact_string_dict(value: object, label: str) -> dict[str, object]:
+    if _TRUSTED_TYPE(value) is not _TRUSTED_DICT_TYPE:
+        raise UnsupportedOpError(f"Unsupported modified {label} mapping")
+    for key in value:
+        if _TRUSTED_TYPE(key) is not _TRUSTED_STR_TYPE:
+            raise UnsupportedOpError(f"Unsupported modified {label} keys")
+    return value
 
 
 def _definition_fingerprint(value: object, seen: set[int] | None = None) -> object:
     active = set() if seen is None else seen
-    if value is None or type(value) in (bool, int, float, complex, str, bytes):
-        return (type(value), value)
+    value_type = _TRUSTED_TYPE(value)
+    if (
+        value is None
+        or value_type is bool
+        or value_type is int
+        or value_type is float
+        or value_type is complex
+        or value_type is str
+        or value_type is bytes
+    ):
+        return (value_type, value)
     identity = id(value)
     if identity in active:
         return ("cycle", identity)
     active.add(identity)
     try:
-        if isinstance(value, FunctionType):
+        if value_type is _TRUSTED_FUNCTION_TYPE:
+            function_globals = _require_exact_string_dict(
+                value.__globals__,
+                "function globals",
+            )
             closure = tuple(
                 _definition_fingerprint(cell.cell_contents, active)
                 for cell in (value.__closure__ or ())
             )
             referenced_globals = tuple(
-                (name, _definition_fingerprint(value.__globals__[name], active))
+                (name, _definition_fingerprint(function_globals[name], active))
                 for name in value.__code__.co_names
-                if name in value.__globals__
+                if name in function_globals
             )
             return (
                 "function",
@@ -56,19 +88,19 @@ def _definition_fingerprint(value: object, seen: set[int] | None = None) -> obje
                 closure,
                 referenced_globals,
             )
-        if isinstance(value, (staticmethod, classmethod)):
-            return (type(value), _definition_fingerprint(value.__func__, active))
-        if isinstance(value, property):
+        if value_type is staticmethod or value_type is classmethod:
+            return (value_type, _definition_fingerprint(value.__func__, active))
+        if value_type is property:
             return (
                 "property",
                 _definition_fingerprint(value.fget, active),
                 _definition_fingerprint(value.fset, active),
                 _definition_fingerprint(value.fdel, active),
             )
-        if type(value) is dict:
+        if value_type is dict:
             return (
                 "dict",
-                tuple(
+                frozenset(
                     (
                         _definition_fingerprint(key, active),
                         _definition_fingerprint(item, active),
@@ -76,19 +108,141 @@ def _definition_fingerprint(value: object, seen: set[int] | None = None) -> obje
                     for key, item in value.items()
                 ),
             )
-        if type(value) in (tuple, list):
+        if value_type is tuple or value_type is list:
             return (
-                type(value),
+                value_type,
                 tuple(_definition_fingerprint(item, active) for item in value),
             )
-        if type(value) in (set, frozenset):
+        if value_type is set or value_type is frozenset:
             return (
-                type(value),
+                value_type,
                 frozenset(_definition_fingerprint(item, active) for item in value),
             )
         return ("identity", identity)
     finally:
         active.remove(identity)
+
+
+def _shallow_state_fingerprint(
+    value: object,
+    seen: set[int] | None = None,
+) -> object:
+    active = set() if seen is None else seen
+    value_type = _TRUSTED_TYPE(value)
+    if (
+        value is None
+        or value_type is bool
+        or value_type is int
+        or value_type is float
+        or value_type is complex
+        or value_type is str
+        or value_type is bytes
+    ):
+        return (value_type, value)
+    if value_type is _TRUSTED_FUNCTION_TYPE:
+        return ("function", id(value), id(value.__code__))
+    if value_type is _TRUSTED_CODE_TYPE:
+        return ("code", id(value))
+    identity = id(value)
+    if identity in active:
+        return ("cycle", identity)
+    active.add(identity)
+    try:
+        if value_type is dict:
+            return (
+                "dict",
+                frozenset(
+                    (
+                        _shallow_state_fingerprint(key, active),
+                        _shallow_state_fingerprint(item, active),
+                    )
+                    for key, item in value.items()
+                ),
+            )
+        if value_type is tuple or value_type is list:
+            return (
+                value_type,
+                tuple(_shallow_state_fingerprint(item, active) for item in value),
+            )
+        if value_type is set or value_type is frozenset:
+            return (
+                value_type,
+                frozenset(
+                    _shallow_state_fingerprint(item, active) for item in value
+                ),
+            )
+        return ("identity", id(value_type), identity)
+    finally:
+        active.remove(identity)
+
+
+def _function_local_fingerprint(function: FunctionType) -> object:
+    closure: list[object] = []
+    for cell in function.__closure__ or ():
+        try:
+            contents = _shallow_state_fingerprint(cell.cell_contents)
+        except ValueError:
+            contents = ("empty",)
+        closure.append((id(cell), contents))
+    return (
+        id(function.__code__),
+        _shallow_state_fingerprint(function.__defaults__),
+        _shallow_state_fingerprint(function.__kwdefaults__),
+        _shallow_state_fingerprint(function.__annotations__),
+        _shallow_state_fingerprint(function.__dict__),
+        tuple(closure),
+    )
+
+
+def _descriptor_local_fingerprint(value: object) -> object:
+    value_type = _TRUSTED_TYPE(value)
+    if value_type is _TRUSTED_FUNCTION_TYPE:
+        return ("function", _function_local_fingerprint(value))
+    if value_type is staticmethod or value_type is classmethod:
+        return (
+            value_type,
+            _function_local_fingerprint(value.__func__),
+        )
+    if value_type is property:
+        return (
+            "property",
+            tuple(
+                _function_local_fingerprint(function)
+                if type(function) is FunctionType
+                else None
+                for function in (value.fget, value.fset, value.fdel)
+            ),
+        )
+    return ("identity", id(value_type), id(value))
+
+
+def _class_local_fingerprint(cls: type[object]) -> object:
+    namespace = type.__getattribute__(cls, "__dict__")
+    return tuple(
+        (name, id(value), _descriptor_local_fingerprint(value))
+        for name, value in sorted(namespace.items(), key=lambda item: item[0])
+    )
+
+
+def _function_referenced_globals_fingerprint(function: FunctionType) -> object:
+    function_globals = _require_exact_string_dict(
+        function.__globals__,
+        "function globals",
+    )
+    return (
+        id(function_globals),
+        tuple(
+            (
+                name,
+                id(function_globals[name]),
+                _function_local_fingerprint(function_globals[name])
+                if _TRUSTED_TYPE(function_globals[name]) is _TRUSTED_FUNCTION_TYPE
+                else _shallow_state_fingerprint(function_globals[name]),
+            )
+            for name in function.__code__.co_names
+            if name in function_globals
+        ),
+    )
 
 
 _TRUSTED_FRAMEWORK_TYPES = (
@@ -97,14 +251,271 @@ _TRUSTED_FRAMEWORK_TYPES = (
     _torch.nn.Identity,
     _torch.nn.Linear,
     _torch.nn.Conv2d,
+    _torch.nn.BatchNorm2d,
     _torch.nn.ReLU,
     _torch.nn.Flatten,
 )
+_TRUSTED_TORCH_MODULE = _torch
+_TRUSTED_TORCH_NN_MODULE = _torch.nn
 _TRUSTED_PARAMETER_TYPE = _torch.nn.Parameter
+_TRUSTED_BUILTINS_MODULE = builtins
 _TRUSTED_BUILTINS = builtins.__dict__
 _TRUSTED_LEN = builtins.len
+_TRUSTED_BUILTIN_BINDINGS = tuple(
+    (name, builtins.__dict__[name])
+    for name in (
+        "AssertionError",
+        "AttributeError",
+        "Exception",
+        "KeyError",
+        "RuntimeError",
+        "StopIteration",
+        "TypeError",
+        "ValueError",
+        "__import__",
+        "all",
+        "any",
+        "bool",
+        "bytes",
+        "callable",
+        "classmethod",
+        "complex",
+        "dict",
+        "enumerate",
+        "float",
+        "frozenset",
+        "getattr",
+        "hasattr",
+        "id",
+        "int",
+        "isinstance",
+        "issubclass",
+        "iter",
+        "len",
+        "list",
+        "max",
+        "min",
+        "next",
+        "object",
+        "property",
+        "range",
+        "repr",
+        "reversed",
+        "set",
+        "sorted",
+        "str",
+        "staticmethod",
+        "sum",
+        "tuple",
+        "type",
+        "vars",
+        "zip",
+    )
+)
+_TRUSTED_COPY_MODULE = copy
 _TRUSTED_DEEPCOPY = copy.deepcopy
 _TRUSTED_DEEPCOPY_CODE = copy.deepcopy.__code__
+_TRUSTED_DEEPCOPY_LOCAL_STATE = _function_local_fingerprint(copy.deepcopy)
+_TRUSTED_DEEPCOPY_DISPATCH = copy._deepcopy_dispatch
+_TRUSTED_DEEPCOPY_DISPATCH_ITEMS = tuple(copy._deepcopy_dispatch.items())
+_TRUSTED_DEEPCOPY_DISPATCH_FUNCTIONS = tuple(
+    (value, _function_local_fingerprint(value))
+    for _, value in _TRUSTED_DEEPCOPY_DISPATCH_ITEMS
+    if type(value) is FunctionType
+)
+_TRUSTED_COPY_DISPATCH_TABLE = copy.dispatch_table
+_TRUSTED_COPY_DISPATCH_TABLE_ITEMS = tuple(copy.dispatch_table.items())
+_TRUSTED_COPY_DISPATCH_TABLE_FUNCTIONS = tuple(
+    (value, _function_local_fingerprint(value))
+    for _, value in _TRUSTED_COPY_DISPATCH_TABLE_ITEMS
+    if type(value) is FunctionType
+)
+_TRUSTED_COPY_DEEPCOPY_GLOBALS = tuple(
+    (
+        name,
+        value,
+        _function_local_fingerprint(value)
+        if type(value) is FunctionType
+        else None,
+    )
+    for name, value in (
+        ("_deepcopy_atomic", copy._deepcopy_atomic),
+        ("_reconstruct", copy._reconstruct),
+        ("_keep_alive", copy._keep_alive),
+        ("Error", copy.Error),
+    )
+)
+_TRUSTED_DIS_MODULE = dis
+_TRUSTED_DIS_BYTECODE = dis.Bytecode
+_TRUSTED_DIS_BYTECODE_METHODS = tuple(
+    (
+        name,
+        value,
+        _function_local_fingerprint(value),
+        _function_referenced_globals_fingerprint(value),
+    )
+    for name, value in (
+        ("__init__", dis.Bytecode.__init__),
+        ("__iter__", dis.Bytecode.__iter__),
+    )
+)
+_TRUSTED_DIS_CLASS_STATES = tuple(
+    (cls, _class_local_fingerprint(cls))
+    for cls in (
+        dis.Bytecode,
+        dis.Instruction,
+        dis._Instruction,
+        dis.Positions,
+        dis._ExceptionTableEntry,
+    )
+)
+_TRUSTED_DIS_NAMEDTUPLE_GLOBALS = tuple(
+    (
+        constructor,
+        constructor.__globals__,
+        constructor.__globals__["_tuple_new"],
+    )
+    for constructor in (
+        type.__getattribute__(dis.Positions, "__dict__")["__new__"].__func__,
+        type.__getattribute__(dis._Instruction, "__dict__")["__new__"].__func__,
+        type.__getattribute__(dis._ExceptionTableEntry, "__dict__")[
+            "__new__"
+        ].__func__,
+    )
+)
+_TRUSTED_DIS_CALLABLE_BINDINGS = tuple(
+    (
+        name,
+        value,
+        _function_local_fingerprint(value)
+        if type(value) is FunctionType
+        else None,
+    )
+    for name, value in (
+        ("_get_code_object", dis._get_code_object),
+        ("findlinestarts", dis.findlinestarts),
+        ("_parse_exception_table", dis._parse_exception_table),
+        ("_get_instructions_bytes", dis._get_instructions_bytes),
+        ("_get_code_array", dis._get_code_array),
+        ("_try_compile", dis._try_compile),
+        ("_parse_varint", dis._parse_varint),
+        ("findlabels", dis.findlabels),
+        ("_unpack_opargs", dis._unpack_opargs),
+        ("_deoptop", dis._deoptop),
+        ("_get_const_value", dis._get_const_value),
+        ("_get_const_info", dis._get_const_info),
+        ("_get_name_info", dis._get_name_info),
+        ("_is_backward_jump", dis._is_backward_jump),
+        ("_ExceptionTableEntry", dis._ExceptionTableEntry),
+        ("Positions", dis.Positions),
+        ("Instruction", dis.Instruction),
+    )
+)
+_TRUSTED_DIS_RUNTIME_STATE = tuple(
+    (name, value, _shallow_state_fingerprint(value))
+    for name, value in (
+        ("__name__", dis.__name__),
+        ("BINARY_OP", dis.BINARY_OP),
+        ("CACHE", dis.CACHE),
+        ("CALL_INTRINSIC_1", dis.CALL_INTRINSIC_1),
+        ("CALL_INTRINSIC_2", dis.CALL_INTRINSIC_2),
+        ("EXTENDED_ARG", dis.EXTENDED_ARG),
+        ("FORMAT_VALUE", dis.FORMAT_VALUE),
+        ("FORMAT_VALUE_CONVERTERS", dis.FORMAT_VALUE_CONVERTERS),
+        ("Instruction", dis.Instruction),
+        ("_Instruction", dis._Instruction),
+        ("LOAD_ATTR", dis.LOAD_ATTR),
+        ("LOAD_GLOBAL", dis.LOAD_GLOBAL),
+        ("LOAD_SUPER_ATTR", dis.LOAD_SUPER_ATTR),
+        ("MAKE_FUNCTION", dis.MAKE_FUNCTION),
+        ("MAKE_FUNCTION_FLAGS", dis.MAKE_FUNCTION_FLAGS),
+        ("Positions", dis.Positions),
+        ("UNKNOWN", dis.UNKNOWN),
+        ("_ExceptionTableEntry", dis._ExceptionTableEntry),
+        ("_INT_OVERFLOW", dis._INT_OVERFLOW),
+        ("_all_opmap", dis._all_opmap),
+        ("_all_opname", dis._all_opname),
+        ("_cache_format", dis._cache_format),
+        ("_inline_cache_entries", dis._inline_cache_entries),
+        ("_intrinsic_1_descs", dis._intrinsic_1_descs),
+        ("_intrinsic_2_descs", dis._intrinsic_2_descs),
+        ("_nb_ops", dis._nb_ops),
+        ("cmp_op", dis.cmp_op),
+        ("deoptmap", dis.deoptmap),
+        ("hasarg", dis.hasarg),
+        ("hascompare", dis.hascompare),
+        ("hasconst", dis.hasconst),
+        ("hasfree", dis.hasfree),
+        ("hasjabs", dis.hasjabs),
+        ("hasjrel", dis.hasjrel),
+        ("haslocal", dis.haslocal),
+        ("hasname", dis.hasname),
+        ("opname", dis.opname),
+        ("sys", dis.sys),
+    )
+)
+_TRUSTED_DIS_HASJABS = dis.hasjabs
+_TRUSTED_DIS_HASJABS_CONTENTS = dis.hasjabs.copy()
+_TRUSTED_DIS_HASJREL = dis.hasjrel
+_TRUSTED_DIS_HASJREL_CONTENTS = dis.hasjrel.copy()
+_TRUSTED_INSPECT_MODULE = inspect
+_TRUSTED_INSPECT_GETATTR_STATIC = inspect.getattr_static
+_TRUSTED_INSPECT_UNWRAP = inspect.unwrap
+_TRUSTED_MATH_MODULE = math
+_TRUSTED_MATH_ISFINITE = math.isfinite
+_TRUSTED_MATH_PROD = math.prod
+_TRUSTED_NUMPY_MODULE = np
+_TRUSTED_SYS_MODULE = sys
+_TRUSTED_SYS_GETRECURSIONLIMIT = sys.getrecursionlimit
+_TRUSTED_SYS_BYTEORDER = sys.byteorder
+_TRUSTED_BOOTSTRAP_GLOBAL_BINDINGS = (
+    ("CodeType", _TRUSTED_CODE_TYPE, "Unsupported modified CodeType binding"),
+    (
+        "FunctionType",
+        _TRUSTED_FUNCTION_TYPE,
+        "Unsupported modified FunctionType binding",
+    ),
+    ("ModuleType", _TRUSTED_MODULE_TYPE, "Unsupported modified ModuleType binding"),
+    ("builtins", _TRUSTED_BUILTINS_MODULE, "Unsupported modified builtins module binding"),
+    ("copy", _TRUSTED_COPY_MODULE, "Unsupported modified copy module binding"),
+    ("dis", _TRUSTED_DIS_MODULE, "Unsupported modified dis module binding"),
+    ("inspect", _TRUSTED_INSPECT_MODULE, "Unsupported modified inspect module binding"),
+    ("math", _TRUSTED_MATH_MODULE, "Unsupported modified math module binding"),
+    ("np", _TRUSTED_NUMPY_MODULE, "Unsupported modified NumPy module binding"),
+    ("sys", _TRUSTED_SYS_MODULE, "Unsupported modified sys module binding"),
+)
+_TRUSTED_TENSOR_COPY_BINDINGS = tuple(
+    (
+        owner,
+        _raw_name,
+        value,
+        _function_local_fingerprint(value),
+        _function_referenced_globals_fingerprint(value),
+    )
+    for owner, _raw_name, value in (
+        (_torch.Tensor, "__deepcopy__", _torch.Tensor.__deepcopy__),
+        (
+            _torch.nn.Parameter,
+            "__deepcopy__",
+            _torch.nn.Parameter.__deepcopy__,
+        ),
+    )
+)
+_TRUSTED_NUMPY_BINDINGS = (
+    (np, "all", np.all),
+    (np, "allclose", np.allclose),
+    (np, "any", np.any),
+    (np, "argmax", np.argmax),
+    (np, "array_equal", np.array_equal),
+    (np, "ascontiguousarray", np.ascontiguousarray),
+    (np, "dtype", np.dtype),
+    (np, "float32", np.float32),
+    (np, "float64", np.float64),
+    (np, "isfinite", np.isfinite),
+    (np, "linspace", np.linspace),
+    (np, "ndarray", np.ndarray),
+    (np, "zeros", np.zeros),
+)
 _TRUSTED_FRAMEWORK_CLASSES = frozenset(
     cls for module_type in _TRUSTED_FRAMEWORK_TYPES for cls in module_type.__mro__
 )
@@ -128,14 +539,51 @@ _TRUSTED_FRAMEWORK_DEFINITIONS = tuple(
     )
 )
 _TRUSTED_FUNCTION_BINDINGS = (
+    *_TRUSTED_NUMPY_BINDINGS,
     (_torch, "nn", _torch.nn),
     (_torch, "fx", _torch.fx),
+    (_torch, "backends", _torch.backends),
+    (_torch.backends, "cudnn", _torch.backends.cudnn),
     (_torch.nn, "functional", _torch.nn.functional),
     (_torch.nn, "modules", _torch.nn.modules),
+    (_torch.nn, "utils", _torch.nn.utils),
+    (_torch.nn, "BatchNorm2d", _torch.nn.BatchNorm2d),
     (_torch.nn.modules, "module", _torch.nn.modules.module),
+    (_torch.nn.modules, "batchnorm", _torch.nn.modules.batchnorm),
+    (
+        _torch.nn.modules.batchnorm,
+        "BatchNorm2d",
+        _torch.nn.modules.batchnorm.BatchNorm2d,
+    ),
+    (
+        _torch.nn.modules.batchnorm,
+        "_BatchNorm",
+        _torch.nn.modules.batchnorm._BatchNorm,
+    ),
+    (
+        _torch.nn.modules.batchnorm,
+        "_NormBase",
+        _torch.nn.modules.batchnorm._NormBase,
+    ),
+    (_torch.nn.utils, "fusion", _torch.nn.utils.fusion),
+    (
+        _torch.nn.utils.fusion,
+        "fuse_conv_bn_eval",
+        _torch.nn.utils.fusion.fuse_conv_bn_eval,
+    ),
+    (
+        _torch.nn.utils.fusion,
+        "fuse_conv_bn_weights",
+        _torch.nn.utils.fusion.fuse_conv_bn_weights,
+    ),
     (_torch.nn.functional, "linear", _torch.nn.functional.linear),
     (_torch.nn.functional, "conv2d", _torch.nn.functional.conv2d),
+    (_torch.nn.functional, "batch_norm", _torch.nn.functional.batch_norm),
     (_torch.nn.functional, "relu", _torch.nn.functional.relu),
+    (_torch, "batch_norm", _torch.batch_norm),
+    (_torch, "zeros_like", _torch.zeros_like),
+    (_torch, "ones_like", _torch.ones_like),
+    (_torch, "rsqrt", _torch.rsqrt),
     (_torch, "relu", _torch.relu),
     (_torch, "relu_", _torch.relu_),
     (_torch, "argmax", _torch.argmax),
@@ -147,14 +595,22 @@ _TRUSTED_FUNCTION_BINDINGS = (
     (_torch, "float32", _torch.float32),
     (_torch, "float64", _torch.float64),
     (_torch, "int64", _torch.int64),
+    (_torch, "preserve_format", _torch.preserve_format),
     (_torch, "strided", _torch.strided),
     (_torch.fx, "symbolic_trace", _torch.fx.symbolic_trace),
     (_torch.Tensor, "argmax", _torch.Tensor.argmax),
+    (_torch.Tensor, "dim", _torch.Tensor.dim),
     (_torch.Tensor, "flatten", _torch.Tensor.flatten),
+    (_torch.Tensor, "reshape", _torch.Tensor.reshape),
+    (_torch.Tensor, "unsqueeze", _torch.Tensor.unsqueeze),
+    (_torch.Tensor, "__add__", _torch.Tensor.__add__),
+    (_torch.Tensor, "__mul__", _torch.Tensor.__mul__),
+    (_torch.Tensor, "__sub__", _torch.Tensor.__sub__),
     (_torch.Tensor, "detach", _torch.Tensor.detach),
     (_torch.Tensor, "numpy", _torch.Tensor.numpy),
     (_torch.Tensor, "cpu", _torch.Tensor.cpu),
     (_torch.Tensor, "contiguous", _torch.Tensor.contiguous),
+    (_torch.Tensor, "clone", _torch.Tensor.clone),
     (_torch.Tensor, "resolve_conj", _torch.Tensor.resolve_conj),
     (_torch.Tensor, "resolve_neg", _torch.Tensor.resolve_neg),
     (_torch.Tensor, "is_contiguous", _torch.Tensor.is_contiguous),
@@ -164,11 +620,34 @@ _TRUSTED_FUNCTION_BINDINGS = (
     (_torch.Tensor, "storage_offset", _torch.Tensor.storage_offset),
     (_torch.Tensor, "to", _torch.Tensor.to),
     (_torch.Tensor, "device", _torch.Tensor.device),
+    (_torch.Tensor, "data", _torch.Tensor.data),
     (_torch.Tensor, "dtype", _torch.Tensor.dtype),
     (_torch.Tensor, "layout", _torch.Tensor.layout),
     (_torch.Tensor, "shape", _torch.Tensor.shape),
     (_torch.Tensor, "grad", _torch.Tensor.grad),
     (_torch.Tensor, "requires_grad", _torch.Tensor.requires_grad),
+)
+_TRUSTED_RUNTIME_MODULES = tuple(
+    (module, type(module))
+    for module in (
+        builtins,
+        copy,
+        dis,
+        inspect,
+        math,
+        np,
+        sys,
+        _torch,
+        _torch.backends,
+        _torch.fx,
+        _torch.nn,
+        _torch.nn.functional,
+        _torch.nn.modules,
+        _torch.nn.modules.batchnorm,
+        _torch.nn.modules.module,
+        _torch.nn.utils,
+        _torch.nn.utils.fusion,
+    )
 )
 _TRUSTED_FUNCTION_FINGERPRINTS = tuple(
     (owner, name, function, _definition_fingerprint(function))
@@ -179,6 +658,9 @@ del _torch
 
 class UnsupportedOpError(RuntimeError):
     """Raised when the FX graph contains an operation outside the MVP subset."""
+
+
+_TRUSTED_UNSUPPORTED_OP_ERROR = UnsupportedOpError
 
 
 def load_model_from_file(path: Path) -> object:
@@ -196,14 +678,13 @@ def load_model_from_file(path: Path) -> object:
     return model
 
 
-def parse_model(
+def _parse_model_impl(
     model: object,
     input_shape: Sequence[int],
-    input_dtype: object | None = None,
+    input_dtype: object | None,
+    torch: object,
+    nn: object,
 ) -> GraphIR:
-    import torch
-    import torch.nn as nn
-
     normalized_input_shape = _validate_input_shape(input_shape)
     float_dtype = _validate_model_semantics(model, nn, torch, input_dtype)
     trace_model = _copy_model_for_tracing(model, nn, torch)
@@ -230,6 +711,8 @@ def parse_model(
             f"Unsupported FX symbolic trace semantics: {trace_error}"
         ) from trace_error
     assert traced is not None
+    traced, transformations = _fuse_conv_batchnorm_eval(traced, nn, torch)
+    has_batchnorm_fusion = bool(transformations)
     modules = dict(_trusted_named_modules(traced, nn))
     input_tensor = TensorIR(
         name="input",
@@ -241,6 +724,9 @@ def parse_model(
     ops: list[object] = []
     saw_argmax = False
     saw_output = False
+    source_current_shape = (
+        (1, *normalized_input_shape) if has_batchnorm_fusion else None
+    )
 
     for node in traced.graph.nodes:
         if node.op == "placeholder":
@@ -272,12 +758,48 @@ def parse_model(
         if node.op == "call_module":
             _require_sequential_input(node, current_node)
             module = modules[str(node.target)]
+            if source_current_shape is not None and type(module) is nn.Flatten:
+                start_dim = _module_integer(
+                    _required_module_attribute(module, "Flatten", "start_dim"),
+                    "Flatten",
+                    "start_dim",
+                )
+                end_dim = _module_integer(
+                    _required_module_attribute(module, "Flatten", "end_dim"),
+                    "Flatten",
+                    "end_dim",
+                )
+                try:
+                    source_flatten_shape = _flatten_shape(
+                        source_current_shape,
+                        start_dim,
+                        end_dim,
+                    )
+                    fused_flatten_shape = _flatten_shape(
+                        current_tensor.shape,
+                        start_dim,
+                        end_dim,
+                    )
+                except UnsupportedOpError as exc:
+                    raise UnsupportedOpError(
+                        "Unsupported Flatten with singleton batch adapter: "
+                        "dimensions must be valid for both source NCHW and "
+                        "fused CHW shapes"
+                    ) from exc
+                if source_flatten_shape != (1, *fused_flatten_shape):
+                    raise UnsupportedOpError(
+                        "Unsupported Flatten with singleton batch adapter: source "
+                        f"shape {source_flatten_shape} does not preserve the fused "
+                        f"batchless shape {(1, *fused_flatten_shape)}"
+                    )
             current_tensor, new_op = _parse_module_node(
                 node_name=_safe_name(str(node.name)),
                 module=module,
                 current_tensor=current_tensor,
                 nn=nn,
             )
+            if source_current_shape is not None:
+                source_current_shape = (1, *current_tensor.shape)
             ops.append(new_op)
             current_node = node
             continue
@@ -320,21 +842,448 @@ def parse_model(
     if not saw_output:
         raise UnsupportedOpError("Unsupported FX graph: missing output node")
 
+    metadata: dict[str, object] = {"source": type(model).__name__}
+    if has_batchnorm_fusion:
+        metadata["input_adapter"] = {"kind": "singleton_batch_n1"}
+        metadata["transformations"] = transformations
     graph = GraphIR(
         input=input_tensor,
         output=current_tensor,
         ops=tuple(ops),
-        metadata={"source": type(model).__name__},
+        metadata=metadata,
     )
+    if has_batchnorm_fusion:
+        _validate_fusion_boundary(
+            source_model=model,
+            fused_model=traced,
+            input_shape=normalized_input_shape,
+            float_dtype=float_dtype,
+            nn=nn,
+            torch=torch,
+        )
     _validate_lowered_semantics(
-        model=model,
+        model=traced if has_batchnorm_fusion else model,
         graph=graph,
         input_shape=normalized_input_shape,
         float_dtype=float_dtype,
         nn=nn,
         torch=torch,
+        copy_model=not has_batchnorm_fusion,
     )
     return graph
+
+
+def _fuse_conv_batchnorm_eval(
+    traced: object,
+    nn: object,
+    torch: object,
+) -> tuple[object, list[dict[str, str]]]:
+    modules = dict(_trusted_named_modules(traced, nn))
+    candidates: list[tuple[object, object, object, object]] = []
+    for node in tuple(traced.graph.nodes):
+        if node.op != "call_module":
+            continue
+        module = modules.get(str(node.target))
+        if type(module) is not nn.BatchNorm2d:
+            continue
+        args = tuple(node.args)
+        kwargs = dict(node.kwargs)
+        if len(args) != 1 or kwargs or not _is_fx_node(args[0]):
+            raise UnsupportedOpError(
+                f"Unsupported BatchNorm2d call at node {node.name}: expected "
+                "one direct Conv2d tensor input"
+            )
+        conv_node = args[0]
+        conv = (
+            modules.get(str(conv_node.target))
+            if conv_node.op == "call_module"
+            else None
+        )
+        if type(conv) is not nn.Conv2d:
+            raise UnsupportedOpError(
+                f"Unsupported BatchNorm2d at node {node.name}: only an exact "
+                "Conv2d -> BatchNorm2d pattern can be fused"
+            )
+        if _fx_node_use_count(traced.graph, conv_node) != 1:
+            raise UnsupportedOpError(
+                f"Unsupported Conv2d fan-out at node {conv_node.name}: "
+                "fusion requires exactly one FX edge use"
+            )
+        if _fx_node_use_count(traced.graph, node) != 1:
+            raise UnsupportedOpError(
+                f"Unsupported BatchNorm2d fan-out at node {node.name}: "
+                "fusion requires exactly one FX edge use"
+            )
+        candidates.append((conv_node, conv, node, module))
+
+    if not candidates:
+        return traced, []
+
+    _require_eval_module(traced, "root model")
+    transformations: list[dict[str, str]] = []
+    for index, (conv_node, conv, batchnorm_node, batchnorm) in enumerate(candidates):
+        _validate_conv_batchnorm_pair(conv, batchnorm, nn, torch)
+        try:
+            fused = torch.nn.utils.fusion.fuse_conv_bn_eval(conv, batchnorm)
+        except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
+            raise UnsupportedOpError(
+                "Unsupported Conv2d -> BatchNorm2d fusion at nodes "
+                f"{conv_node.name} -> {batchnorm_node.name}: {exc}"
+            ) from exc
+        _validate_fused_conv(fused, conv, nn)
+        fused_target = _fresh_fused_target(traced, index)
+        traced.add_module(fused_target, fused)
+        original_conv_target = str(conv_node.target)
+        original_batchnorm_target = str(batchnorm_node.target)
+        conv_node.target = fused_target
+        batchnorm_node.replace_all_uses_with(conv_node)
+        traced.graph.erase_node(batchnorm_node)
+        transformations.append(
+            {
+                "kind": "conv2d_batchnorm2d_fusion",
+                "conv_node": str(conv_node.name),
+                "conv_target": original_conv_target,
+                "batchnorm_node": str(batchnorm_node.name),
+                "batchnorm_target": original_batchnorm_target,
+                "fused_target": fused_target,
+            }
+        )
+
+    traced.graph.lint()
+    traced.recompile()
+    traced.delete_all_unused_submodules()
+    traced.graph.lint()
+    traced.recompile()
+    remaining_modules = dict(_trusted_named_modules(traced, nn))
+    for node in traced.graph.nodes:
+        if node.op == "call_module" and type(
+            remaining_modules.get(str(node.target))
+        ) is nn.BatchNorm2d:
+            raise UnsupportedOpError(
+                f"Unsupported unfused BatchNorm2d at FX node {node.name}"
+            )
+    return traced, transformations
+
+
+def _validate_conv_batchnorm_pair(
+    conv: object,
+    batchnorm: object,
+    nn: object,
+    torch: object,
+) -> None:
+    if type(conv) is not nn.Conv2d or type(batchnorm) is not nn.BatchNorm2d:
+        raise UnsupportedOpError(
+            "Unsupported fusion module types: exact Conv2d and BatchNorm2d "
+            "instances are required"
+        )
+    conv_state = _raw_module_state(conv)
+    if {"weight", "bias"}.intersection(conv_state):
+        raise UnsupportedOpError(
+            "Unsupported Conv2d instance schema: parameter slots must not be "
+            "shadowed by direct attributes"
+        )
+    _require_eval_module(conv, "Conv2d")
+    _require_eval_module(batchnorm, "BatchNorm2d")
+
+    out_channels = _positive_module_integer(
+        _required_module_attribute(conv, "Conv2d", "out_channels"),
+        "Conv2d",
+        "out_channels",
+    )
+    num_features = _positive_module_integer(
+        _required_module_attribute(batchnorm, "BatchNorm2d", "num_features"),
+        "BatchNorm2d",
+        "num_features",
+    )
+    if num_features != out_channels:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d num_features: expected Conv2d "
+            f"out_channels={out_channels}, got {num_features}"
+        )
+
+    state = _raw_module_state(batchnorm)
+    parameters = state.get("_parameters")
+    buffers = state.get("_buffers")
+    children = state.get("_modules")
+    registry_names = {
+        "weight",
+        "bias",
+        "running_mean",
+        "running_var",
+        "num_batches_tracked",
+    }
+    shadowed_names = registry_names.intersection(state)
+    if shadowed_names:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d instance schema: parameter and buffer "
+            "slots must not be shadowed by direct attributes"
+        )
+    if type(children) is not dict or children:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d module schema: child modules are not allowed"
+        )
+    if type(parameters) is not dict or set(parameters) != {"weight", "bias"}:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d parameter schema: expected exactly "
+            "weight and bias slots"
+        )
+    expected_buffers = {"running_mean", "running_var", "num_batches_tracked"}
+    if type(buffers) is not dict or set(buffers) != expected_buffers:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d buffer schema: expected exactly "
+            "running_mean, running_var, and num_batches_tracked slots"
+        )
+    non_persistent = state.get("_non_persistent_buffers_set")
+    if type(non_persistent) is not set or non_persistent:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d buffer schema: running statistics must "
+            "be persistent"
+        )
+
+    affine = _required_module_attribute(batchnorm, "BatchNorm2d", "affine")
+    if type(affine) is not bool:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d affine: expected a built-in boolean"
+        )
+    weight = parameters["weight"]
+    bias = parameters["bias"]
+    if affine:
+        weight = _required_parameter(weight, "BatchNorm2d", "weight", nn)
+        try:
+            constructor = _raw_static_attribute(nn.BatchNorm2d, "__init__")
+        except AttributeError as exc:
+            raise UnsupportedOpError(
+                "Unsupported BatchNorm2d constructor metadata"
+            ) from exc
+        if type(constructor) is not FunctionType:
+            raise UnsupportedOpError(
+                "Unsupported BatchNorm2d constructor metadata"
+            )
+        constructor_code = constructor.__code__
+        kwonly_start = constructor_code.co_argcount
+        kwonly_stop = kwonly_start + constructor_code.co_kwonlyargcount
+        kwdefaults = constructor.__kwdefaults__
+        supports_optional_bias = (
+            "bias" in constructor_code.co_varnames[kwonly_start:kwonly_stop]
+            and type(kwdefaults) is dict
+            and kwdefaults.get("bias") is True
+        )
+        if supports_optional_bias:
+            bias = _optional_parameter(bias, "BatchNorm2d", "bias", nn)
+        else:
+            bias = _required_parameter(bias, "BatchNorm2d", "bias", nn)
+    elif weight is not None or bias is not None:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d parameter schema: affine=False requires "
+            "empty weight and bias slots"
+        )
+
+    track_running_stats = _required_module_attribute(
+        batchnorm,
+        "BatchNorm2d",
+        "track_running_stats",
+    )
+    if type(track_running_stats) is not bool or not track_running_stats:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d track_running_stats: running statistics "
+            "are required for eval fusion"
+        )
+    running_mean = buffers["running_mean"]
+    running_var = buffers["running_var"]
+    counter = buffers["num_batches_tracked"]
+    for name, tensor in (
+        ("running_mean", running_mean),
+        ("running_var", running_var),
+    ):
+        if type(tensor) is not torch.Tensor:
+            raise UnsupportedOpError(
+                f"Unsupported BatchNorm2d {name}: expected a Tensor"
+            )
+        if tuple(tensor.shape) != (num_features,):
+            raise UnsupportedOpError(
+                f"Unsupported BatchNorm2d {name} shape: expected "
+                f"({num_features},), got {tuple(tensor.shape)}"
+            )
+        if tensor.requires_grad:
+            raise UnsupportedOpError(
+                f"Unsupported BatchNorm2d {name}: buffers must not require gradients"
+            )
+    if (
+        type(counter) is not torch.Tensor
+        or counter.dtype is not torch.int64
+        or tuple(counter.shape) != ()
+        or counter.requires_grad
+    ):
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d num_batches_tracked: expected a "
+            "non-gradient scalar int64 Tensor"
+        )
+    counter_value = int(counter.detach().cpu().numpy().item())
+    if counter_value < 0:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d num_batches_tracked: expected a "
+            "non-negative value"
+        )
+
+    expected_shape = (num_features,)
+    for name, tensor in (("weight", weight), ("bias", bias)):
+        if tensor is not None and tuple(tensor.shape) != expected_shape:
+            raise UnsupportedOpError(
+                f"Unsupported BatchNorm2d {name} shape: expected "
+                f"{expected_shape}, got {tuple(tensor.shape)}"
+            )
+
+    conv_weight = _required_parameter(
+        _required_module_attribute(conv, "Conv2d", "weight"),
+        "Conv2d",
+        "weight",
+        nn,
+    )
+    conv_bias = _optional_parameter(
+        _required_module_attribute(conv, "Conv2d", "bias"),
+        "Conv2d",
+        "bias",
+        nn,
+    )
+    floating_tensors = [conv_weight, running_mean, running_var]
+    floating_tensors.extend(
+        tensor for tensor in (conv_bias, weight, bias) if tensor is not None
+    )
+    dtype = conv_weight.dtype
+    if dtype not in (torch.float32, torch.float64) or any(
+        tensor.dtype is not dtype for tensor in floating_tensors
+    ):
+        raise UnsupportedOpError(
+            "Unsupported Conv2d/BatchNorm2d dtype: all fusion parameters and "
+            "statistics must use one float32 or float64 dtype"
+        )
+    for name, tensor in (
+        ("Conv2d weight", conv_weight),
+        ("Conv2d bias", conv_bias),
+        ("BatchNorm2d weight", weight),
+        ("BatchNorm2d bias", bias),
+        ("BatchNorm2d running_mean", running_mean),
+        ("BatchNorm2d running_var", running_var),
+    ):
+        if tensor is not None and not _tensor_values_are_finite(tensor):
+            raise UnsupportedOpError(
+                f"Unsupported {name}: fusion inputs must contain only finite values"
+            )
+
+    eps = _required_module_attribute(batchnorm, "BatchNorm2d", "eps")
+    if type(eps) is not float or not math.isfinite(eps) or eps < 0.0:
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d eps: expected a finite non-negative "
+            "built-in float"
+        )
+    running_var_values = running_var.detach().cpu().numpy()
+    if np.any(running_var_values < 0):
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d running_var: values must be non-negative"
+        )
+    variance_with_eps = (running_var + eps).detach().cpu().numpy()
+    if not np.all(np.isfinite(variance_with_eps)) or np.any(variance_with_eps <= 0):
+        raise UnsupportedOpError(
+            "Unsupported BatchNorm2d running_var + eps: every channel must "
+            "have a finite positive denominator"
+        )
+
+
+def _require_eval_module(module: object, label: str) -> None:
+    training = _required_module_attribute(module, label, "training")
+    if type(training) is not bool or training:
+        raise UnsupportedOpError(
+            f"Unsupported {label} training state: Conv2d/BatchNorm2d fusion "
+            "requires eval mode"
+        )
+
+
+def _validate_fused_conv(
+    fused: object,
+    source_conv: object,
+    nn: object,
+) -> None:
+    if type(fused) is not nn.Conv2d:
+        raise UnsupportedOpError(
+            "Unsupported official fusion result: expected an exact Conv2d"
+        )
+    weight = _required_parameter(
+        _required_module_attribute(fused, "fused Conv2d", "weight"),
+        "fused Conv2d",
+        "weight",
+        nn,
+    )
+    bias = _required_parameter(
+        _required_module_attribute(fused, "fused Conv2d", "bias"),
+        "fused Conv2d",
+        "bias",
+        nn,
+    )
+    source_weight = _required_parameter(
+        _required_module_attribute(source_conv, "Conv2d", "weight"),
+        "Conv2d",
+        "weight",
+        nn,
+    )
+    if weight.dtype is not source_weight.dtype or bias.dtype is not source_weight.dtype:
+        raise UnsupportedOpError(
+            "Unsupported official fusion result: fused parameter dtype changed"
+        )
+    if not _tensor_values_are_finite(weight) or not _tensor_values_are_finite(bias):
+        raise UnsupportedOpError(
+            "Unsupported official fusion result: fused Conv2d parameters "
+            "must contain only finite values"
+        )
+    _require_eval_module(fused, "fused Conv2d")
+
+
+def _tensor_values_are_finite(tensor: object) -> bool:
+    values = tensor.detach().cpu().numpy()
+    return bool(np.all(np.isfinite(values)))
+
+
+def _fresh_fused_target(traced: object, index: int) -> str:
+    base = f"_torch2rtl_fused_conv_bn_{index}"
+    candidate = base
+    suffix = 0
+    state = _raw_module_state(traced)
+    modules = state.get("_modules")
+    if type(modules) is not dict:
+        raise UnsupportedOpError("Unsupported FX GraphModule module registry")
+    while candidate in state or candidate in modules or hasattr(traced, candidate):
+        suffix += 1
+        candidate = f"{base}_{suffix}"
+    return candidate
+
+
+def _fx_node_use_count(graph: object, target: object) -> int:
+    count = 0
+    for node in graph.nodes:
+        count += _fx_value_reference_count(node.args, target)
+        count += _fx_value_reference_count(node.kwargs, target)
+    return count
+
+
+def _fx_value_reference_count(value: object, target: object) -> int:
+    if value is target:
+        return 1
+    if isinstance(value, (tuple, list)):
+        count = 0
+        for item in value:
+            count += _fx_value_reference_count(item, target)
+        return count
+    if isinstance(value, dict):
+        count = 0
+        for key, item in value.items():
+            count += _fx_value_reference_count(key, target)
+            count += _fx_value_reference_count(item, target)
+        return count
+    if type(value) is slice:
+        count = 0
+        for item in (value.start, value.stop, value.step):
+            count += _fx_value_reference_count(item, target)
+        return count
+    return 0
 
 
 def _parse_module_node(
@@ -630,7 +1579,6 @@ def _validate_model_semantics(
     torch: object,
     input_dtype: object | None,
 ) -> str:
-    _validate_framework_integrity(nn)
     if not isinstance(model, nn.Module):
         raise UnsupportedOpError(
             f"Unsupported model type: expected torch.nn.Module, got {type(model).__name__}"
@@ -655,7 +1603,7 @@ def _validate_model_semantics(
                 "hook semantics are not lowered"
             )
 
-    lowered_types = (nn.Linear, nn.Conv2d, nn.ReLU, nn.Flatten)
+    lowered_types = (nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.ReLU, nn.Flatten)
     modules = tuple(_trusted_named_modules(model, nn))
     for module_name, module in modules:
         display_name = module_name or "<root>"
@@ -681,6 +1629,11 @@ def _validate_model_semantics(
                 f"Unsupported forward pre-hook on module {display_name}: "
                 "hook semantics are not lowered"
             )
+        if state.get("_backward_hooks") or state.get("_backward_pre_hooks"):
+            raise UnsupportedOpError(
+                f"Unsupported backward hook on module {display_name}: "
+                "hook semantics are not lowered"
+            )
         if isinstance(module, lowered_types):
             if type(module) not in lowered_types:
                 raise UnsupportedOpError(
@@ -693,7 +1646,12 @@ def _validate_model_semantics(
         torch.float64: "float64",
     }
     model_dtypes: set[object] = set()
-    for tensor_name, tensor in _trusted_named_tensors(modules, torch):
+    for tensor_name, tensor, is_batchnorm_counter in _trusted_named_tensors(
+        modules,
+        torch,
+    ):
+        if is_batchnorm_counter:
+            continue
         if tensor.dtype not in supported:
             raise UnsupportedOpError(
                 f"Unsupported dtype {tensor.dtype} for tensor {tensor_name}; "
@@ -735,7 +1693,7 @@ def _validate_module_dispatch(
         "_call_impl",
         "_compiled_call_impl",
     ):
-        if inspect.getattr_static(module_type, attribute) is not inspect.getattr_static(
+        if _raw_static_attribute(module_type, attribute) is not _raw_static_attribute(
             nn.Module,
             attribute,
         ):
@@ -750,7 +1708,7 @@ def _validate_module_dispatch(
                 f"{display_name}: call semantics are not lowered"
             )
     for attribute in ("__getattribute__", "__getattr__"):
-        if inspect.getattr_static(module_type, attribute) is not inspect.getattr_static(
+        if _raw_static_attribute(module_type, attribute) is not _raw_static_attribute(
             nn.Module,
             attribute,
         ):
@@ -780,7 +1738,7 @@ def _validate_no_custom_introspection(
         "buffers",
         "children",
     ):
-        if inspect.getattr_static(type(module), attribute) is not inspect.getattr_static(
+        if _raw_static_attribute(type(module), attribute) is not _raw_static_attribute(
             nn.Module,
             attribute,
         ) or attribute in state:
@@ -900,9 +1858,7 @@ def _validate_reachable_python_function(
     if identity in seen:
         return
     seen.add(identity)
-    if getattr(function, "__wrapped__", None) is not None or inspect.unwrap(
-        function
-    ) is not function:
+    if "__wrapped__" in function.__dict__:
         raise UnsupportedOpError(f"Unsupported decorated function {label}")
     if function.__dict__:
         raise UnsupportedOpError(f"Unsupported custom function state in {label}")
@@ -1065,15 +2021,36 @@ def _find_custom_method(
     return None
 
 
+def _raw_static_attribute(owner: object, name: str) -> object:
+    namespace = object.__getattribute__(owner, "__dict__")
+    if type(namespace) is dict:
+        _require_exact_string_dict(namespace, "runtime namespace")
+        if name in namespace:
+            return namespace[name]
+        raise AttributeError(name)
+    for cls in type.__getattribute__(owner, "__mro__"):
+        namespace = type.__getattribute__(cls, "__dict__")
+        if name in namespace:
+            return namespace[name]
+    raise AttributeError(name)
+
+
+def _raw_python_module_namespace(module: ModuleType) -> dict[str, object]:
+    namespace = _TRUSTED_MODULE_GETATTRIBUTE(module, "__dict__")
+    return _require_exact_string_dict(namespace, "runtime module namespace")
+
+
 def _framework_module_classes(nn: object) -> frozenset[type[object]]:
+    namespace = _raw_python_module_namespace(nn)
     current_types = (
-        nn.Module,
-        nn.Sequential,
-        nn.Identity,
-        nn.Linear,
-        nn.Conv2d,
-        nn.ReLU,
-        nn.Flatten,
+        namespace.get("Module"),
+        namespace.get("Sequential"),
+        namespace.get("Identity"),
+        namespace.get("Linear"),
+        namespace.get("Conv2d"),
+        namespace.get("BatchNorm2d"),
+        namespace.get("ReLU"),
+        namespace.get("Flatten"),
     )
     if any(
         current is not trusted
@@ -1087,20 +2064,222 @@ def _framework_module_classes(nn: object) -> frozenset[type[object]]:
     return _TRUSTED_FRAMEWORK_CLASSES
 
 
-def _validate_framework_integrity(nn: object) -> None:
+# These helpers are the transitive Python call graph of the integrity check.
+# Pin their module bindings before invoking any of them.
+_TRUSTED_INTEGRITY_HELPER_BINDINGS = (
+    ("_class_local_fingerprint", _class_local_fingerprint),
+    ("_definition_fingerprint", _definition_fingerprint),
+    ("_descriptor_local_fingerprint", _descriptor_local_fingerprint),
+    ("_framework_module_classes", _framework_module_classes),
+    ("_function_local_fingerprint", _function_local_fingerprint),
+    (
+        "_function_referenced_globals_fingerprint",
+        _function_referenced_globals_fingerprint,
+    ),
+    ("_raw_python_module_namespace", _raw_python_module_namespace),
+    ("_raw_static_attribute", _raw_static_attribute),
+    ("_require_exact_string_dict", _require_exact_string_dict),
+    ("_shallow_state_fingerprint", _shallow_state_fingerprint),
+)
+
+
+def _validate_framework_integrity_impl(nn: object) -> None:
+    for key in _TRUSTED_FRONTEND_GLOBALS:
+        if _TRUSTED_TYPE(key) is not _TRUSTED_STR_TYPE:
+            raise _TRUSTED_UNSUPPORTED_OP_ERROR(
+                "Unsupported modified frontend runtime keys"
+            )
     if (
-        copy.deepcopy is not _TRUSTED_DEEPCOPY
-        or copy.deepcopy.__code__ is not _TRUSTED_DEEPCOPY_CODE
+        _TRUSTED_FRONTEND_GLOBALS.get("UnsupportedOpError")
+        is not _TRUSTED_UNSUPPORTED_OP_ERROR
     ):
-        raise UnsupportedOpError("Unsupported modified model copy function")
+        raise _TRUSTED_UNSUPPORTED_OP_ERROR(
+            "Unsupported modified frontend error binding"
+        )
+    if (
+        _TRUSTED_FRONTEND_GLOBALS.get("_validate_framework_integrity")
+        is not _TRUSTED_VALIDATE_FRAMEWORK_INTEGRITY
+    ):
+        raise _TRUSTED_UNSUPPORTED_OP_ERROR(
+            "Unsupported modified frontend integrity validator"
+        )
+    for name, trusted, error in _TRUSTED_BOOTSTRAP_GLOBAL_BINDINGS:
+        if _TRUSTED_FRONTEND_GLOBALS.get(name) is not trusted:
+            raise UnsupportedOpError(error)
+    for name, function in _TRUSTED_INTEGRITY_HELPER_BINDINGS:
+        if _TRUSTED_FRONTEND_GLOBALS.get(name) is not function:
+            raise UnsupportedOpError(
+                f"Unsupported modified frontend integrity helper {name}"
+            )
+    for module, module_type in _TRUSTED_RUNTIME_MODULES:
+        if _TRUSTED_TYPE(module) is not module_type:
+            raise UnsupportedOpError("Unsupported modified runtime module type")
+
+    builtins_state = _raw_python_module_namespace(builtins)
+    if builtins_state is not _TRUSTED_BUILTINS:
+        raise UnsupportedOpError("Unsupported modified builtins state mapping")
+    for name, value in _TRUSTED_BUILTIN_BINDINGS:
+        if builtins_state.get(name) is not value:
+            raise UnsupportedOpError(f"Unsupported modified builtins binding {name}")
+
+    if (
+        _raw_python_module_namespace(sys).get("getrecursionlimit")
+        is not _TRUSTED_SYS_GETRECURSIONLIMIT
+        or _raw_python_module_namespace(sys).get("byteorder")
+        is not _TRUSTED_SYS_BYTEORDER
+    ):
+        raise UnsupportedOpError("Unsupported modified sys runtime bindings")
+
+    inspect_state = _raw_python_module_namespace(inspect)
+    if inspect_state.get("getattr_static") is not _TRUSTED_INSPECT_GETATTR_STATIC:
+        raise UnsupportedOpError("Unsupported modified inspect.getattr_static binding")
+    if inspect_state.get("unwrap") is not _TRUSTED_INSPECT_UNWRAP:
+        raise UnsupportedOpError("Unsupported modified inspect.unwrap binding")
+
+    copy_state = _raw_python_module_namespace(copy)
+    copy_deepcopy = copy_state.get("deepcopy")
+    if copy_deepcopy is not _TRUSTED_DEEPCOPY:
+        raise UnsupportedOpError("Unsupported modified copy.deepcopy function")
+    if (
+        copy_deepcopy.__code__ is not _TRUSTED_DEEPCOPY_CODE
+        or _function_local_fingerprint(copy_deepcopy)
+        != _TRUSTED_DEEPCOPY_LOCAL_STATE
+    ):
+        raise UnsupportedOpError("Unsupported modified copy.deepcopy function")
+    deepcopy_dispatch = copy_state.get("_deepcopy_dispatch")
+    copy_dispatch_table = copy_state.get("dispatch_table")
+    if (
+        deepcopy_dispatch is not _TRUSTED_DEEPCOPY_DISPATCH
+        or copy_dispatch_table is not _TRUSTED_COPY_DISPATCH_TABLE
+        or _TRUSTED_LEN(deepcopy_dispatch)
+        != _TRUSTED_LEN(_TRUSTED_DEEPCOPY_DISPATCH_ITEMS)
+        or _TRUSTED_LEN(copy_dispatch_table)
+        != _TRUSTED_LEN(_TRUSTED_COPY_DISPATCH_TABLE_ITEMS)
+    ):
+        raise UnsupportedOpError("Unsupported modified model copy dispatch")
+    for key, value in deepcopy_dispatch.items():
+        if not any(
+            key is trusted_key and value is trusted_value
+            for trusted_key, trusted_value in _TRUSTED_DEEPCOPY_DISPATCH_ITEMS
+        ):
+            raise UnsupportedOpError("Unsupported modified model copy dispatch")
+    for key, value in copy_dispatch_table.items():
+        if not any(
+            key is trusted_key and value is trusted_value
+            for trusted_key, trusted_value in _TRUSTED_COPY_DISPATCH_TABLE_ITEMS
+        ):
+            raise UnsupportedOpError("Unsupported modified model copy dispatch")
+    for function, state in _TRUSTED_DEEPCOPY_DISPATCH_FUNCTIONS:
+        if _function_local_fingerprint(function) != state:
+            raise UnsupportedOpError("Unsupported modified model copy dispatch")
+    for function, state in _TRUSTED_COPY_DISPATCH_TABLE_FUNCTIONS:
+        if _function_local_fingerprint(function) != state:
+            raise UnsupportedOpError("Unsupported modified model copy dispatch")
+    for name, value, state in _TRUSTED_COPY_DEEPCOPY_GLOBALS:
+        current = copy_state.get(name)
+        if current is not value:
+            raise UnsupportedOpError("Unsupported modified model copy helper")
+        if state is not None and _function_local_fingerprint(current) != state:
+            raise UnsupportedOpError("Unsupported modified model copy helper")
+    for owner, name, value, state, globals_state in _TRUSTED_TENSOR_COPY_BINDINGS:
+        try:
+            current = _raw_static_attribute(owner, name)
+        except AttributeError as exc:
+            raise UnsupportedOpError(
+                "Unsupported modified tensor copy binding"
+            ) from exc
+        if (
+            current is not value
+            or _function_local_fingerprint(current) != state
+            or _function_referenced_globals_fingerprint(current) != globals_state
+        ):
+            raise UnsupportedOpError("Unsupported modified tensor copy binding")
+
+    math_state = _raw_python_module_namespace(math)
+    if (
+        math_state.get("isfinite") is not _TRUSTED_MATH_ISFINITE
+        or math_state.get("prod") is not _TRUSTED_MATH_PROD
+    ):
+        raise UnsupportedOpError("Unsupported modified math runtime bindings")
+
+    dis_state = _raw_python_module_namespace(dis)
+    current_hasjabs = dis_state.get("hasjabs")
+    current_hasjrel = dis_state.get("hasjrel")
+    if dis_state.get("Bytecode") is not _TRUSTED_DIS_BYTECODE:
+        raise UnsupportedOpError("Unsupported modified dis.Bytecode binding")
+    for name, value, state in _TRUSTED_DIS_RUNTIME_STATE:
+        current = dis_state.get(name)
+        if current is not value or _shallow_state_fingerprint(current) != state:
+            raise UnsupportedOpError(f"Unsupported modified dis state {name}")
+    for cls, state in _TRUSTED_DIS_CLASS_STATES:
+        if _class_local_fingerprint(cls) != state:
+            raise UnsupportedOpError("Unsupported modified dis runtime classes")
+    for constructor, globals_state, tuple_new in _TRUSTED_DIS_NAMEDTUPLE_GLOBALS:
+        if constructor.__globals__ is not globals_state:
+            raise UnsupportedOpError(
+                "Unsupported modified dis named-tuple constructor"
+            )
+        _require_exact_string_dict(globals_state, "dis named-tuple globals")
+        if globals_state.get("_tuple_new") is not tuple_new:
+            raise UnsupportedOpError(
+                "Unsupported modified dis named-tuple constructor"
+            )
+    bytecode_namespace = type.__getattribute__(_TRUSTED_DIS_BYTECODE, "__dict__")
+    for name, value, state, globals_state in _TRUSTED_DIS_BYTECODE_METHODS:
+        current = bytecode_namespace.get(name)
+        if (
+            current is not value
+            or _function_local_fingerprint(current) != state
+            or _function_referenced_globals_fingerprint(current) != globals_state
+        ):
+            raise UnsupportedOpError("Unsupported modified dis.Bytecode methods")
+    for name, value, state in _TRUSTED_DIS_CALLABLE_BINDINGS:
+        current = dis_state.get(name)
+        if current is not value:
+            raise UnsupportedOpError(f"Unsupported modified dis binding {name}")
+        if state is not None and _function_local_fingerprint(current) != state:
+            raise UnsupportedOpError(f"Unsupported modified dis binding {name}")
+    if (
+        current_hasjabs is not _TRUSTED_DIS_HASJABS
+        or current_hasjrel is not _TRUSTED_DIS_HASJREL
+        or _TRUSTED_LEN(current_hasjabs) != _TRUSTED_LEN(
+            _TRUSTED_DIS_HASJABS_CONTENTS
+        )
+        or _TRUSTED_LEN(current_hasjrel) != _TRUSTED_LEN(
+            _TRUSTED_DIS_HASJREL_CONTENTS
+        )
+    ):
+        raise UnsupportedOpError("Unsupported modified dis jump tables")
+    index = 0
+    for value in current_hasjabs:
+        if (
+            type(value) is not int
+            or value != _TRUSTED_DIS_HASJABS_CONTENTS[index]
+        ):
+            raise UnsupportedOpError("Unsupported modified dis jump tables")
+        index += 1
+    index = 0
+    for value in current_hasjrel:
+        if (
+            type(value) is not int
+            or value != _TRUSTED_DIS_HASJREL_CONTENTS[index]
+        ):
+            raise UnsupportedOpError("Unsupported modified dis jump tables")
+        index += 1
+
     for owner, name, function, fingerprint in _TRUSTED_FUNCTION_FINGERPRINTS:
-        current = inspect.getattr_static(owner, name)
+        try:
+            current = _raw_static_attribute(owner, name)
+        except AttributeError as exc:
+            raise UnsupportedOpError(
+                f"Unsupported modified framework/runtime binding {name}"
+            ) from exc
         if current is not function or _definition_fingerprint(current) != fingerprint:
             raise UnsupportedOpError(
-                f"Unsupported modified PyTorch framework function {name}"
+                f"Unsupported modified framework/runtime binding {name}"
             )
     _framework_module_classes(nn)
-    if nn.Parameter is not _TRUSTED_PARAMETER_TYPE:
+    if nn.__dict__.get("Parameter") is not _TRUSTED_PARAMETER_TYPE:
         raise UnsupportedOpError("Unsupported modified PyTorch framework Parameter")
     for cls, before in _TRUSTED_FRAMEWORK_DEFINITIONS:
         current = dict(vars(cls))
@@ -1112,6 +2291,108 @@ def _validate_framework_integrity(nn: object) -> None:
             raise UnsupportedOpError(
                 f"Unsupported modified PyTorch framework class {cls.__name__}"
             )
+
+
+def _make_integrity_validator(
+    implementation: object,
+    parse_implementation: object,
+    frontend_globals: dict[str, object],
+    trusted_type: type[object],
+    trusted_str_type: type[str],
+    trusted_error: type[UnsupportedOpError],
+    trusted_global_bindings: tuple[tuple[str, object], ...],
+) -> object:
+    # This wrapper is the bootstrap trust boundary. Its references live in
+    # closure cells, so replacing their module-global mirrors cannot affect
+    # the code that detects the replacement.
+    def validate(nn: object) -> None:
+        for key in frontend_globals:
+            if trusted_type(key) is not trusted_str_type:
+                raise trusted_error("Unsupported modified frontend runtime keys")
+        for name, value in trusted_global_bindings:
+            if frontend_globals.get(name) is not value:
+                raise trusted_error(
+                    f"Unsupported modified frontend trust root {name}"
+                )
+        if frontend_globals.get("UnsupportedOpError") is not trusted_error:
+            raise trusted_error("Unsupported modified frontend error binding")
+        if (
+            frontend_globals.get("_parse_model_impl")
+            is not parse_implementation
+        ):
+            raise trusted_error("Unsupported modified frontend parser implementation")
+        if (
+            frontend_globals.get("_validate_framework_integrity_impl")
+            is not implementation
+        ):
+            raise trusted_error(
+                "Unsupported modified frontend integrity implementation"
+            )
+        if frontend_globals.get("_validate_framework_integrity") is not validate:
+            raise trusted_error("Unsupported modified frontend integrity validator")
+        if (
+            frontend_globals.get("_TRUSTED_VALIDATE_FRAMEWORK_INTEGRITY")
+            is not validate
+        ):
+            raise trusted_error("Unsupported modified frontend validator trust root")
+        implementation(nn)
+
+    return validate
+
+
+_validate_framework_integrity = _make_integrity_validator(
+    _validate_framework_integrity_impl,
+    _parse_model_impl,
+    _TRUSTED_FRONTEND_GLOBALS,
+    _TRUSTED_TYPE,
+    _TRUSTED_STR_TYPE,
+    _TRUSTED_UNSUPPORTED_OP_ERROR,
+    tuple(
+        (name, value)
+        for name, value in _TRUSTED_FRONTEND_GLOBALS.items()
+        if name.startswith("_TRUSTED_")
+    ),
+)
+_TRUSTED_VALIDATE_FRAMEWORK_INTEGRITY = _validate_framework_integrity
+
+
+def _make_parse_model(
+    implementation: object,
+    validator: object,
+    torch: object,
+    nn: object,
+    frontend_globals: dict[str, object],
+    trusted_type: type[object],
+    trusted_str_type: type[str],
+    trusted_error: type[UnsupportedOpError],
+) -> object:
+    def parse_model(
+        model: object,
+        input_shape: Sequence[int],
+        input_dtype: object | None = None,
+    ) -> GraphIR:
+        for key in frontend_globals:
+            if trusted_type(key) is not trusted_str_type:
+                raise trusted_error("Unsupported modified frontend runtime keys")
+        if frontend_globals.get("parse_model") is not parse_model:
+            raise trusted_error("Unsupported modified frontend parser binding")
+        validator(nn)
+        return implementation(model, input_shape, input_dtype, torch, nn)
+
+    return parse_model
+
+
+parse_model = _make_parse_model(
+    _parse_model_impl,
+    _validate_framework_integrity,
+    _TRUSTED_TORCH_MODULE,
+    _TRUSTED_TORCH_NN_MODULE,
+    _TRUSTED_FRONTEND_GLOBALS,
+    _TRUSTED_TYPE,
+    _TRUSTED_STR_TYPE,
+    _TRUSTED_UNSUPPORTED_OP_ERROR,
+)
+parse_model.__qualname__ = "parse_model"
 
 
 def _next_loaded_attribute(
@@ -1270,8 +2551,8 @@ def _trusted_named_modules(model: object, nn: object) -> tuple[tuple[str, object
 def _trusted_named_tensors(
     modules: tuple[tuple[str, object], ...],
     torch: object,
-) -> tuple[tuple[str, object], ...]:
-    tensors: list[tuple[str, object]] = []
+) -> tuple[tuple[str, object, bool], ...]:
+    tensors: list[tuple[str, object, bool]] = []
     for module_name, module in modules:
         state = _raw_module_state(module)
         for registry_name in ("_parameters", "_buffers"):
@@ -1335,7 +2616,19 @@ def _trusted_named_tensors(
                         "autograd state is not lowered"
                     )
                 qualified = f"{module_name}.{tensor_name}" if module_name else tensor_name
-                tensors.append((qualified, tensor))
+                is_batchnorm_counter = (
+                    type(module) is torch.nn.BatchNorm2d
+                    and registry_name == "_buffers"
+                    and tensor_name == "num_batches_tracked"
+                )
+                if is_batchnorm_counter and (
+                    tensor.dtype is not torch.int64 or tuple(tensor.shape) != ()
+                ):
+                    raise UnsupportedOpError(
+                        "Unsupported BatchNorm2d num_batches_tracked: expected "
+                        "a scalar int64 Tensor"
+                    )
+                tensors.append((qualified, tensor, is_batchnorm_counter))
     return tuple(tensors)
 
 
@@ -1461,6 +2754,151 @@ def _freeze_state_value(value: object, torch: object, seen: set[int]) -> object:
         seen.remove(identity)
 
 
+def _validate_fusion_boundary(
+    source_model: object,
+    fused_model: object,
+    input_shape: tuple[int, ...],
+    float_dtype: str,
+    nn: object,
+    torch: object,
+) -> None:
+    dtype = torch.float32 if float_dtype == "float32" else torch.float64
+    numpy_dtype = np.dtype(float_dtype)
+    element_count = math.prod(input_shape)
+    probe_values = (
+        np.zeros(input_shape, dtype=numpy_dtype),
+        np.linspace(-0.75, 0.75, num=element_count, dtype=numpy_dtype).reshape(
+            input_shape
+        ),
+    )
+    rtol, atol = (
+        (1e-5, 1e-6) if float_dtype == "float32" else (1e-12, 1e-12)
+    )
+    for values in probe_values:
+        probe_input = torch.from_numpy(values.copy()).to(dtype=dtype)
+        source_output = _run_concrete_probe(
+            source_model,
+            probe_input.unsqueeze(0),
+            "source singleton-batch",
+            nn,
+            torch,
+        )
+        fused_output = _run_concrete_probe(
+            fused_model,
+            probe_input,
+            "fused batchless",
+            nn,
+            torch,
+            copy_model=False,
+        )
+        if not isinstance(source_output, torch.Tensor) or not isinstance(
+            fused_output,
+            torch.Tensor,
+        ):
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: source and fused models must "
+                "return one Tensor"
+            )
+        if source_output.dtype != fused_output.dtype:
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: source and fused output dtypes "
+                f"differ ({source_output.dtype} != {fused_output.dtype})"
+            )
+
+        source_values = source_output.detach().cpu().numpy()
+        fused_values = fused_output.detach().cpu().numpy()
+        if source_values.shape == () or fused_values.shape == ():
+            if (
+                source_values.shape != ()
+                or fused_values.shape != ()
+                or source_output.dtype is not torch.int64
+                or source_values.item() != fused_values.item()
+            ):
+                raise UnsupportedOpError(
+                    "Unsupported fusion semantics: scalar Argmax/class_id "
+                    "changed across Conv2d/BatchNorm2d fusion"
+                )
+            continue
+
+        if source_output.dtype is not dtype or fused_output.dtype is not dtype:
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: tensor outputs must preserve "
+                f"the model dtype {dtype}"
+            )
+        if source_values.shape[0] != 1:
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: source tensor output must have "
+                "a leading singleton batch dimension"
+            )
+        source_batchless = source_values[0]
+        if source_batchless.shape != fused_values.shape:
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: source singleton-batch output "
+                f"shape {source_batchless.shape} does not match fused batchless "
+                f"shape {fused_values.shape}"
+            )
+        if not np.all(np.isfinite(source_batchless)) or not np.all(
+            np.isfinite(fused_values)
+        ):
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: source and fused outputs must "
+                "contain only finite values"
+            )
+        if not np.allclose(
+            source_batchless,
+            fused_values,
+            rtol=rtol,
+            atol=atol,
+        ):
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: source singleton-batch output "
+                "does not match fused batchless output"
+            )
+        if int(np.argmax(source_batchless.reshape(-1))) != int(
+            np.argmax(fused_values.reshape(-1))
+        ):
+            raise UnsupportedOpError(
+                "Unsupported fusion semantics: Argmax/class_id changed across "
+                "Conv2d/BatchNorm2d fusion"
+            )
+
+
+def _run_concrete_probe(
+    model: object,
+    probe_input: object,
+    label: str,
+    nn: object,
+    torch: object,
+    *,
+    copy_model: bool = True,
+) -> object:
+    probe_model = _copy_model_for_tracing(model, nn, torch) if copy_model else model
+    before_state = _snapshot_module_state(probe_model, nn, torch)
+    class_state = _snapshot_module_class_definitions(probe_model, nn)
+    probe_error: Exception | None = None
+    output: object | None = None
+    try:
+        with torch.no_grad():
+            output = probe_model(probe_input)
+    except Exception as exc:
+        probe_error = exc
+    class_changed = _restore_module_class_definitions(class_state)
+    instance_changed = before_state != _snapshot_module_state(
+        probe_model,
+        nn,
+        torch,
+    )
+    if class_changed or instance_changed:
+        raise UnsupportedOpError(
+            f"Unsupported Python state mutation during {label} semantic probe"
+        )
+    if probe_error is not None:
+        raise UnsupportedOpError(
+            f"Unsupported {label} model semantics: {probe_error}"
+        ) from probe_error
+    return output
+
+
 def _validate_lowered_semantics(
     model: object,
     graph: GraphIR,
@@ -1468,6 +2906,8 @@ def _validate_lowered_semantics(
     float_dtype: str,
     nn: object,
     torch: object,
+    *,
+    copy_model: bool = True,
 ) -> None:
     from torch2rtl.quant.reference import infer_float_graph
 
@@ -1481,7 +2921,9 @@ def _validate_lowered_semantics(
         ),
     )
     for values in probe_values:
-        probe_model = _copy_model_for_tracing(model, nn, torch)
+        probe_model = (
+            _copy_model_for_tracing(model, nn, torch) if copy_model else model
+        )
         before_state = _snapshot_module_state(probe_model, nn, torch)
         class_state = _snapshot_module_class_definitions(probe_model, nn)
         probe_error: Exception | None = None

@@ -47,6 +47,7 @@ flowchart LR
 | `torch.nn.ReLU` | есть |
 | полное `torch.nn.Flatten` в один вектор | есть |
 | `torch.nn.Conv2d` для статического unbatched входа `(C, H, W)` | есть |
+| автоматический fusion точной пары `Conv2d -> BatchNorm2d` | есть |
 | финальный глобальный `argmax(dim=None, keepdim=False)` | есть |
 | signed int8 fixed-point по умолчанию | есть |
 | combinational SystemVerilog backend | есть |
@@ -99,6 +100,49 @@ class TinyMLP(nn.Module):
         return self.net(x)
 ```
 
+### Автоматический fusion BatchNorm2d
+
+`parse_model()` сворачивает точную пару `nn.Conv2d -> nn.BatchNorm2d` в новый
+`Conv2d` с пересчитанными весами и смещением. Исходная модель не меняется, а
+`BatchNorm2d` не попадает в GraphIR и RTL. Вручную вызывать
+`torch.nn.utils.fusion.fuse_conv_bn_eval()` не нужно.
+
+```python
+import torch.nn as nn
+
+from torch2rtl.frontend.pytorch_fx import parse_model
+
+
+model = nn.Sequential(
+    nn.Conv2d(3, 8, kernel_size=3, padding=1, bias=False),
+    nn.BatchNorm2d(8),
+    nn.ReLU(),
+).eval()
+
+graph = parse_model(model, input_shape=(3, 16, 16))
+```
+
+Публичный вход остается в формате CHW без размерности пакета данных. Перед прямым
+вызовом `parse_model()` модель нужно перевести в `eval`. Поддерживаются
+`Conv2d(bias=True/False)`, `BatchNorm2d(affine=True/False)`, `float32` и
+`float64`. При `affine=True` `weight` должен иметь точный тип `nn.Parameter`.
+`bias` может быть `None` только в версии PyTorch, чей конструктор принимает
+`bias=False`; в остальных случаях `bias` должен иметь точный тип
+`nn.Parameter`. При `affine=False` оба слота должны быть `None`.
+
+`eps` должен иметь точный встроенный тип `float` и конечное неотрицательное
+значение. Значение `eps=0.0` допустимо, если выражение `running_var + eps` имеет
+конечное положительное значение в каждом канале. Отрицательный `eps` отклоняется
+до fusion. Выходы `Conv2d` и `BatchNorm2d` должны иметь ровно по одному
+FX-использованию. Требуются `track_running_stats=True`, конечные `running_mean` и
+неотрицательный конечный `running_var`. Проверка исходной модели и результата
+fusion требует точного совпадения итогового `argmax`, даже когда близкие
+значения логитов укладываются в допуск численного сравнения.
+
+При fusion `graph.metadata` получает `input_adapter` и `transformations`;
+`report.json` сохраняет их как `graph.input_adapter` и
+`graph.transformations`.
+
 ## Честные ограничения
 
 `torch2rtl` пока не пытается компилировать любой PyTorch-код. Сейчас вне зоны
@@ -110,6 +154,12 @@ class TinyMLP(nn.Module):
 - batch/prefix dimensions для `Linear` и batch для `Conv2d`;
 - ветвления, skip-connections, несколько входов/выходов и произвольный FX DAG;
 - частичный `Flatten` и параметризованный `argmax(dim=...)`;
+- `BatchNorm2d` в режиме training, вне пары с `Conv2d` или с fan-out; fusion
+  принимает только точные типы `nn.Conv2d` и `nn.BatchNorm2d` с накопленной
+  статистикой;
+- при выполненном fusion `Flatten` разрешен только тогда, когда после применения
+  `Flatten` выполняется
+  `source_flatten_shape == (1, *fused_flatten_shape)`;
 - module/global hooks, subclasses, custom metaclasses и instance-level
   `forward`/call overrides;
 - custom attribute/call/copy descriptors, decorated `forward`, переопределённые
@@ -124,7 +174,8 @@ class TinyMLP(nn.Module):
 - training graph, autograd и GPU-логика;
 - grouped/depthwise convolution, dilation;
 - Conv2d structural/index values вне signed 32-bit SystemVerilog `int`;
-- normalization, attention и большие современные архитектуры;
+- другие операции нормализации, включая `BatchNorm1d` и `BatchNorm3d`,
+  attention и большие современные архитектуры;
 - production timing closure.
 
 Если модель содержит неподдерживаемый FX-узел, проект падает явно через

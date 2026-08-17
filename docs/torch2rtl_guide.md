@@ -45,6 +45,8 @@ torch2rtl = "torch2rtl.cli:main"
 - `torch.nn.ReLU`;
 - `torch.nn.Flatten`, только полное преобразование в один вектор;
 - `torch.nn.Conv2d` без размерности пакета данных, с обычными группами `groups=1`, нулевым дополнением и `dilation=1`;
+- точная пара `torch.nn.Conv2d -> torch.nn.BatchNorm2d`, которую frontend
+  автоматически сворачивает в `Conv2d` до GraphIR;
 - финальный глобальный `argmax(dim=None, keepdim=False)`.
 
 FX-граф должен быть одной последовательной цепочкой с одним входом и одним
@@ -60,6 +62,7 @@ FX-граф должен быть одной последовательной ц
 ```text
 Модель PyTorch
   -> граф torch.fx
+  -> fusion пары Conv2d + BatchNorm2d при наличии допустимой пары
   -> GraphIR
   -> квантованный граф
   -> SystemVerilog-файлы
@@ -161,6 +164,108 @@ def load_model_from_file(path: Path) -> object:
         model.eval()
     return model
 ```
+
+## Автоматический fusion BatchNorm2d
+
+`load_model_from_file()` переводит загруженную модель в `eval`. При прямом
+вызове `parse_model()` это должен сделать пользователь. `parse_model()` не
+меняет режим исходной модели.
+
+```python
+import torch.nn as nn
+
+from torch2rtl.frontend.pytorch_fx import parse_model
+
+
+model = nn.Sequential(
+    nn.Conv2d(3, 8, kernel_size=3, padding=1, bias=False),
+    nn.BatchNorm2d(8, affine=True),
+    nn.ReLU(),
+).eval()
+
+graph = parse_model(model, input_shape=(3, 16, 16))
+```
+
+Публичная форма входа остается `(C, H, W)`. После построения FX-графа frontend
+находит точную соседнюю пару `nn.Conv2d -> nn.BatchNorm2d` и вызывает официальный
+`torch.nn.utils.fusion.fuse_conv_bn_eval()`. Для каждой допустимой пары в
+FX-графе создается отдельный `Conv2d` с пересчитанными весами и новым смещением
+`bias`. Исходная модель не меняется. `BatchNorm2d` не появляется в GraphIR,
+фиксированно-точечной эталонной модели или RTL.
+
+В режиме `eval` `BatchNorm2d` использует фиксированную накопленную статистику.
+Поэтому его поканальное преобразование можно включить в веса и смещение `Conv2d`
+без отдельного оператора и отдельного аппаратного блока.
+
+Для одного выходного канала fusion использует формулы
+
+```text
+scale = gamma / sqrt(running_var + eps)
+W' = W * scale
+b' = (b - running_mean) * scale + beta
+```
+
+Если у `Conv2d` нет смещения, в формуле берется `b = 0`. При
+`BatchNorm2d(affine=False)` используются `gamma = 1` и `beta = 0`. Если API
+установленной версии PyTorch позволяет задать
+`BatchNorm2d(affine=True, bias=False)`, параметр `gamma` сохраняется, а
+`beta = 0`. Frontend пересчитывает каждую пару отдельно, поэтому цепочка с
+несколькими парами получает независимые `W'` и `b'`.
+
+Пакет размера `N=1` нужен только для Boundary A. На этой границе исходная
+PyTorch-модель получает NCHW, а FX GraphModule после fusion получает CHW. После
+проверки GraphIR и весь аппаратный путь снова работают только с CHW. Это не
+означает, что публичный интерфейс поддерживает пакетную обработку.
+
+Поддерживаются четыре сочетания `Conv2d.bias` и `BatchNorm2d.affine`, а также
+`float32` и `float64`. При `affine=True` `weight` должен иметь точный тип
+`nn.Parameter`. `bias` может быть `None` только в версии PyTorch, чей конструктор
+принимает `bias=False`; в остальных случаях `bias` должен иметь точный тип
+`nn.Parameter`. При `affine=False` оба слота должны быть `None`.
+
+`eps` должен иметь встроенный тип `float` и конечное неотрицательное значение.
+Значение `eps=0.0` допустимо, если выражение `running_var + eps` имеет конечное
+положительное значение в каждом канале. Отрицательный `eps` отклоняется до
+вызова официального fusion. Для fusion также требуются точные типы модулей,
+режим `eval`, корректная накопленная статистика, совпадающее число каналов и
+отсутствие fan-out.
+`BatchNorm2d` вне пары, режим training, `track_running_stats=False`, подклассы,
+`BatchNorm1d` и `BatchNorm3d` приводят к `UnsupportedOpError`.
+
+`Flatten` после fusion разрешается только при структурном совпадении. После
+применения `Flatten` должно выполняться
+`source_flatten_shape == (1, *fused_flatten_shape)`. Поэтому
+`Flatten(-3, -1)` после `Conv2d` допустим, а `Flatten(0, -1)` нет, даже если
+число элементов случайно совпадает.
+
+При fusion в `GraphIR.metadata` появляются два поля:
+
+```python
+graph.metadata["input_adapter"]
+# {"kind": "singleton_batch_n1"}
+
+graph.metadata["transformations"]
+# [{
+#     "kind": "conv2d_batchnorm2d_fusion",
+#     "conv_node": "conv",
+#     "conv_target": "conv",
+#     "batchnorm_node": "bn",
+#     "batchnorm_target": "bn",
+#     "fused_target": "_torch2rtl_fused_conv_bn_0",
+# }]
+```
+
+Компилятор записывает те же необязательные поля в `report.json` по путям
+`graph.input_adapter` и `graph.transformations`. У модели без fusion этих полей
+нет. Метрика `metrics.parameters` учитывает параметры нового `Conv2d`, включая
+смещение `bias`, которое появляется при fusion исходного
+`Conv2d(bias=False)`.
+
+Boundary A сравнивает выход исходной модели с выходом FX GraphModule после
+fusion. Форма, dtype и конечность значений проверяются отдельно. После этого
+frontend требует точного совпадения `argmax`. Изменение итогового класса при
+близких значениях логитов всегда приводит к `UnsupportedOpError`, даже если
+сами логиты проходят `allclose` с допуском для своего dtype.
 
 Внутреннее представление задано короткими замороженными классами. Фрагмент из `torch2rtl/ir/ops.py` показывает операции, с которыми дальше работают квантование и генератор.
 
@@ -630,6 +735,13 @@ HTML-страница самодостаточна: в нее встроены �
 - нет поддержки размерности пакета данных для `Conv2d`;
 - `Linear` поддерживает только 1-D вход без batch/prefix dimensions;
 - `Flatten` должен превращать весь тензор в один вектор;
+- fusion поддерживает только точную пару `Conv2d -> BatchNorm2d` в `eval` с
+  накопленной статистикой, без `BatchNorm2d` вне пары и без fan-out;
+- `BatchNorm2d(affine=True, bias=False)` требует версии PyTorch с аргументом
+  `bias`; конечный неотрицательный `eps` разрешен только при конечном
+  положительном `running_var + eps` в каждом канале;
+- при fusion `Flatten` должен сохранять структуру пакета размера 1 по правилу
+  `source_flatten_shape == (1, *fused_flatten_shape)`;
 - FX-граф должен быть одной цепочкой без ветвлений и нескольких выходов;
 - explicit `argmax` поддержан только с `dim=None, keepdim=False`;
 - dtype параметров и buffers должен быть однородным `float32` или `float64`;
@@ -663,7 +775,8 @@ HTML-страница самодостаточна: в нее встроены �
   SystemVerilog `int`;
 - structural sizes должны быть положительными built-in `int`; input dimensions
   и `Flatten.start_dim/end_dim` не преобразуют `bool`, строки или subclasses;
-- нет grouped convolution, depthwise convolution, normalization, attention и больших современных архитектур;
+- нет grouped convolution, depthwise convolution, других операций нормализации,
+  attention и больших современных архитектур;
 - текущая схема комбинационная и не имеет потокового интерфейса;
 - Yosys используется только для простого `read_verilog`, `prep -top top`, `stat`;
 - проверочные векторы случайны и строятся для фиксированно-точечной эталонной

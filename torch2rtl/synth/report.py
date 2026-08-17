@@ -163,6 +163,67 @@ def _validate_compile_report_metadata(report: object) -> str | None:
     ops = graph.get("ops")
     if type(ops) is not list or any(type(name) is not str for name in ops):
         return "graph.ops must be a list of strings"
+    input_adapter_present = "input_adapter" in graph
+    transformations_present = "transformations" in graph
+    if input_adapter_present != transformations_present:
+        return (
+            "graph.input_adapter and graph.transformations must either both "
+            "be present or both be absent"
+        )
+    if input_adapter_present:
+        input_adapter = graph["input_adapter"]
+        if type(input_adapter) is not dict or set(input_adapter) != {"kind"}:
+            return (
+                "graph.input_adapter must be an object containing only the "
+                "required kind field"
+            )
+        if input_adapter["kind"] != "singleton_batch_n1":
+            return "graph.input_adapter.kind has an unsupported value"
+
+        transformations = graph["transformations"]
+        if type(transformations) is not list or not transformations:
+            return "graph.transformations must be a non-empty list"
+        required_fields = {
+            "kind",
+            "conv_node",
+            "conv_target",
+            "batchnorm_node",
+            "batchnorm_target",
+            "fused_target",
+        }
+        fused_targets: set[str] = set()
+        conv_nodes: set[str] = set()
+        batchnorm_nodes: set[str] = set()
+        for index, record in enumerate(transformations):
+            if type(record) is not dict or set(record) != required_fields:
+                return (
+                    f"graph.transformations[{index}] must contain exactly the "
+                    "required Conv2d/BatchNorm2d fusion fields"
+                )
+            if record["kind"] != "conv2d_batchnorm2d_fusion":
+                return (
+                    f"graph.transformations[{index}].kind has an unsupported value"
+                )
+            if any(
+                type(record[name]) is not str or not record[name]
+                for name in required_fields - {"kind"}
+            ):
+                return (
+                    f"graph.transformations[{index}] fields must be non-empty "
+                    "strings"
+                )
+            fused_target = record["fused_target"]
+            if fused_target in fused_targets:
+                return "graph.transformations fused_target values must be unique"
+            fused_targets.add(fused_target)
+            conv_node = record["conv_node"]
+            if conv_node in conv_nodes:
+                return "graph.transformations conv_node values must be unique"
+            conv_nodes.add(conv_node)
+            batchnorm_node = record["batchnorm_node"]
+            if batchnorm_node in batchnorm_nodes:
+                return "graph.transformations batchnorm_node values must be unique"
+            batchnorm_nodes.add(batchnorm_node)
 
     metrics = report.get("metrics")
     if type(metrics) is not dict:
