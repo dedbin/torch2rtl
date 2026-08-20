@@ -52,6 +52,8 @@ torch2rtl = "torch2rtl.cli:main"
 FX-граф должен быть одной последовательной цепочкой с одним входом и одним
 тензорным выходом. Точные границы подмножества зафиксированы в
 `docs/v0.2_semantic_correctness.md`.
+Актуальная внутренняя карта frontend и правила его изменения находятся в
+`docs/frontend_architecture.md`.
 
 Ключевое проектное решение: сначала строится маленькое внутреннее представление, а уже потом из него создаются фиксированно-точечная эталонная модель, SystemVerilog, проверочные векторы, отчет и визуализация. Поэтому новые операции нужно добавлять не во все места сразу хаотично, а последовательно: разбор PyTorch, внутреннее представление, квантование, эталонный расчет, шаблон SystemVerilog, тесты.
 
@@ -61,9 +63,13 @@ FX-граф должен быть одной последовательной ц
 
 ```text
 Модель PyTorch
+  -> public parse_model wrapper в frontend/pytorch_fx.py
+  -> фиксированный pipeline в frontend/_pipeline.py
+  -> model contract и controlled copy/state
   -> граф torch.fx
   -> fusion пары Conv2d + BatchNorm2d при наличии допустимой пары
-  -> GraphIR
+  -> GraphIR lowering
+  -> semantic probes
   -> квантованный граф
   -> SystemVerilog-файлы
   -> input_vectors.txt, expected_classes.txt и expected_logits.txt
@@ -131,7 +137,14 @@ def cmd_compile(args: argparse.Namespace) -> int:
 | `pyproject.toml` | Метаданные пакета, зависимости, точка входа `torch2rtl`, настройки `pytest`. |
 | `torch2rtl/cli.py` | Команды `compile`, `verify`, `synth`, `visualize`, `demo`. |
 | `torch2rtl/demo.py` | Описание готовых демонстраций и общий демонстрационный запуск. |
-| `torch2rtl/frontend/pytorch_fx.py` | Разбор PyTorch-модели через `torch.fx` и построение `GraphIR`. |
+| `torch2rtl/frontend/pytorch_fx.py` | Публичный API, загрузка модели, runtime consistency checks и явный component manifest. |
+| `torch2rtl/frontend/_pipeline.py` | Фиксированный порядок стадий от model contract до semantic probes. |
+| `torch2rtl/frontend/_model_contract.py` | Проверка поддерживаемого подмножества модели и Python-состояния. |
+| `torch2rtl/frontend/_state_guard.py` | Controlled copy, snapshots и восстановление состояния. |
+| `torch2rtl/frontend/_fusion.py` | Проверка и преобразование пары `Conv2d -> BatchNorm2d`. |
+| `torch2rtl/frontend/_lowering.py` | Последовательный FX contract и построение `GraphIR`. |
+| `torch2rtl/frontend/_semantics.py` | Проверка fusion boundary и точного соответствия lowered GraphIR. |
+| `torch2rtl/frontend/_errors.py` | Единое определение `UnsupportedOpError`. |
 | `torch2rtl/ir/` | Классы внутреннего представления: граф, тензор, операции. |
 | `torch2rtl/quant/` | Фиксированная точка, квантование и эталонный расчет на Python. |
 | `torch2rtl/backend/systemverilog/` | Генерация SystemVerilog и шаблоны Jinja2. |
@@ -148,6 +161,11 @@ def cmd_compile(args: argparse.Namespace) -> int:
 Главная точка входа для пользователя находится в `torch2rtl/cli.py`. Команды устроены тонкими обертками над функциями пакета: это облегчает тестирование и позволяет примерам вызывать те же функции напрямую.
 
 `torch2rtl/frontend/pytorch_fx.py` загружает модель из файла и ожидает, что файл определит `create_model()` или глобальную переменную `model`. После загрузки модель переводится в режим оценки, если у нее есть метод `eval`.
+
+Публичный `parse_model` в этом же файле остаётся стабильной точкой входа, но не
+содержит саму orchestration/lowering логику. После проверки runtime consistency wrapper
+вызывает `_pipeline.py`; последующие проверки и преобразования выполняют узкие
+frontend-компоненты из таблицы выше.
 
 ```python
 def load_model_from_file(path: Path) -> object:
@@ -378,21 +396,24 @@ def emit_systemverilog(
 
 Здесь свертка взвешивает каждый квадрат `2x2`, а линейный слой фактически выбирает один из четырех элементов результата. Такая модель хорошо подходит для демонстрации: из нее легко мысленно проследить, почему конкретный участок входной сетки дает больший логит.
 
-Разбор PyTorch-графа происходит в `parse_model`. Для `Conv2d` код проверяет форму входа, группы, режим дополнения и растяжение ядра. Фрагмент из `torch2rtl/frontend/pytorch_fx.py`:
+Разбор PyTorch-графа начинается в `parse_model`, а обработчик `Conv2d` находится
+в `torch2rtl/frontend/_lowering.py`. Он проверяет форму входа, группы, режим
+дополнения и растяжение ядра. Фрагмент из `_lowering.py`:
 
 ```python
-    if isinstance(module, nn.Conv2d):
-        if len(current_tensor.shape) == 4:
-            raise UnsupportedOpError(
-                "Unsupported Conv2d input: batch dimension is not supported; "
-                "use unbatched (C, H, W)"
-            )
-        if len(current_tensor.shape) != 3:
-            raise UnsupportedOpError(
-                f"Unsupported Conv2d input rank: expected (C, H, W), got {current_tensor.shape}"
-            )
-        if int(module.groups) != 1:
-            raise UnsupportedOpError("Unsupported Conv2d groups: only groups=1 is supported")
+    if len(current_tensor.shape) == 4:
+        raise UnsupportedOpError(
+            "Unsupported Conv2d input: batch dimension is not supported; "
+            "use unbatched (C, H, W)"
+        )
+    if len(current_tensor.shape) != 3:
+        raise UnsupportedOpError(
+            f"Unsupported Conv2d input rank: expected (C, H, W), got {current_tensor.shape}"
+        )
+    if groups != 1:
+        raise UnsupportedOpError(
+            "Unsupported Conv2d groups: only groups=1 is supported"
+        )
 ```
 
 После разбора получается последовательность операций. Тест `tests/test_examples.py` фиксирует ожидаемый порядок для `tiny-conv`:
@@ -792,8 +813,8 @@ HTML-страница самодостаточна: в нее встроены �
 - SHA-256 гарантированно связывает только RTL sources, а для vectors и report проверяются структура, диапазоны и contract-bearing metadata;
 - обнаружение произвольной допустимой замены vector payload без изменения результата или несвязанного report-поля не гарантируется;
 - локальный manifest хранится в том же build directory и не является внешним корнем доверия;
-- согласованная злонамеренная замена RTL, vectors, report и хешей одновременно находится вне threat model;
-- защита от такого сценария потребовала бы внешней подписи, доверенного manifest либо полной регенерации из доверенных исходников;
+- согласованная замена RTL, vectors, report и хешей одновременно находится вне модели защиты текущих проверок;
+- независимая проверка такого сценария потребовала бы внешней подписи, доверенного manifest либо полной регенерации из исходников;
 - качество классификации зависит от выбранной модели и квантования; проект не доказывает точность модели на реальном наборе данных.
 
 Если граф содержит неподдержанный узел, `parse_model` выбрасывает `UnsupportedOpError`. Это лучше, чем молча сгенерировать неправильную схему: пользователь сразу видит, на какой операции остановился разбор.

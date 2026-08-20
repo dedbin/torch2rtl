@@ -7,23 +7,28 @@ import importlib.util
 import inspect
 import math
 import sys
-from collections import OrderedDict
-from collections.abc import Sequence as SequenceABC
 from pathlib import Path
 from types import CodeType, FunctionType, ModuleType
 from typing import Sequence
 
 import numpy as np
 import torch as _torch
+import torch2rtl.quant.reference as _quant_reference
 
+from torch2rtl.frontend import _errors as _errors_component
+from torch2rtl.frontend import _fusion as _fusion_component
+from torch2rtl.frontend import _lowering as _lowering_component
+from torch2rtl.frontend import _model_contract as _model_contract_component
+from torch2rtl.frontend import _pipeline as _pipeline_component
+from torch2rtl.frontend import _semantics as _semantics_component
+from torch2rtl.frontend import _state_guard as _state_guard_component
 from torch2rtl.ir.graph import GraphIR
 from torch2rtl.ir.ops import ArgmaxIR, Conv2dIR, FlattenIR, LinearIR, ReluIR
 from torch2rtl.ir.tensor import TensorIR
 
 
-_MAX_TENSOR_ELEMENTS = 1_000_000
-_MAX_TENSOR_RANK = 64
-_SV_INT_MAX = (1 << 31) - 1
+_parse_model_impl = _pipeline_component._parse_model_impl
+
 # Bootstrap must not resolve these names through mutable builtins or a mutable
 # frontend alias before the builtins integrity check has completed.
 _TRUSTED_TYPE = type
@@ -33,7 +38,145 @@ _TRUSTED_CODE_TYPE = CodeType
 _TRUSTED_FUNCTION_TYPE = FunctionType
 _TRUSTED_MODULE_TYPE = ModuleType
 _TRUSTED_MODULE_GETATTRIBUTE = ModuleType.__getattribute__
+_TRUSTED_TYPE_GETATTRIBUTE = type.__getattribute__
 _TRUSTED_FRONTEND_GLOBALS = globals()
+_TRUSTED_FRONTEND_MODULE = sys.modules[__name__]
+_TRUSTED_EMPTY_CELL = object()
+_TRUSTED_QUANT_REFERENCE_MODULE = _quant_reference
+_TRUSTED_QUANT_REFERENCE_GLOBALS = ModuleType.__getattribute__(
+    _quant_reference,
+    "__dict__",
+)
+_TRUSTED_INFER_FLOAT_GRAPH = _quant_reference.infer_float_graph
+_TRUSTED_IS_GRAD_ENABLED = _torch.is_grad_enabled
+_TRUSTED_SET_GRAD_ENABLED = _torch._C._set_grad_enabled
+_TRUSTED_TORCH_C_MODULE = _torch._C
+_TRUSTED_ERRORS_MODULE = _errors_component
+_TRUSTED_ERRORS_GLOBALS = ModuleType.__getattribute__(
+    _errors_component,
+    "__dict__",
+)
+_TRUSTED_FUSION_MODULE = _fusion_component
+_TRUSTED_FUSION_GLOBALS = ModuleType.__getattribute__(
+    _fusion_component,
+    "__dict__",
+)
+_TRUSTED_LOWERING_MODULE = _lowering_component
+_TRUSTED_LOWERING_GLOBALS = ModuleType.__getattribute__(
+    _lowering_component,
+    "__dict__",
+)
+_TRUSTED_MODEL_CONTRACT_MODULE = _model_contract_component
+_TRUSTED_MODEL_CONTRACT_GLOBALS = ModuleType.__getattribute__(
+    _model_contract_component,
+    "__dict__",
+)
+_TRUSTED_PIPELINE_MODULE = _pipeline_component
+_TRUSTED_PIPELINE_GLOBALS = ModuleType.__getattribute__(
+    _pipeline_component,
+    "__dict__",
+)
+_TRUSTED_SEMANTICS_MODULE = _semantics_component
+_TRUSTED_SEMANTICS_GLOBALS = ModuleType.__getattribute__(
+    _semantics_component,
+    "__dict__",
+)
+_TRUSTED_STATE_GUARD_MODULE = _state_guard_component
+_TRUSTED_STATE_GUARD_GLOBALS = ModuleType.__getattribute__(
+    _state_guard_component,
+    "__dict__",
+)
+
+
+def _capture_function_integrity_state(function: FunctionType) -> tuple[object, ...]:
+    def mapping_state(value: object) -> tuple[object, tuple[tuple[object, object], ...]]:
+        if type(value) is not dict:
+            return (value, ())
+        return (value, tuple(value.items()))
+
+    closure: list[tuple[object, object]] = []
+    for cell in function.__closure__ or ():
+        try:
+            contents = cell.cell_contents
+        except ValueError:
+            contents = _TRUSTED_EMPTY_CELL
+        closure.append((cell, contents))
+    return (
+        function,
+        function.__code__,
+        function.__defaults__,
+        mapping_state(function.__kwdefaults__),
+        mapping_state(function.__annotations__),
+        mapping_state(function.__dict__),
+        tuple(closure),
+    )
+
+
+def _function_integrity_state_matches(
+    function: object,
+    state: tuple[object, ...],
+    trusted_type: type[object],
+    trusted_function_type: type[FunctionType],
+    trusted_dict_type: type[dict[object, object]],
+    trusted_str_type: type[str],
+    trusted_len: object,
+    trusted_value_error: type[ValueError],
+    empty_cell: object,
+) -> bool:
+    if trusted_type(function) is not trusted_function_type:
+        return False
+    (
+        expected_function,
+        expected_code,
+        expected_defaults,
+        expected_kwdefaults,
+        expected_annotations,
+        expected_function_dict,
+        expected_closure,
+    ) = state
+    if (
+        function is not expected_function
+        or function.__code__ is not expected_code
+        or function.__defaults__ is not expected_defaults
+    ):
+        return False
+    for current, expected in (
+        (function.__kwdefaults__, expected_kwdefaults),
+        (function.__annotations__, expected_annotations),
+        (function.__dict__, expected_function_dict),
+    ):
+        expected_mapping, expected_items = expected
+        if current is not expected_mapping:
+            return False
+        if expected_mapping is None:
+            continue
+        if trusted_type(current) is not trusted_dict_type:
+            return False
+        if trusted_len(current) != trusted_len(expected_items):
+            return False
+        for key in current:
+            if trusted_type(key) is not trusted_str_type:
+                return False
+        for key, value in expected_items:
+            if current.get(key, empty_cell) is not value:
+                return False
+    current_closure = function.__closure__ or ()
+    if trusted_len(current_closure) != trusted_len(expected_closure):
+        return False
+    index = 0
+    for current_cell in current_closure:
+        expected = expected_closure[index]
+        index += 1
+        expected_cell, expected_contents = expected
+        if current_cell is not expected_cell:
+            return False
+        try:
+            current_contents = current_cell.cell_contents
+        except trusted_value_error:
+            current_contents = empty_cell
+        if current_contents is not expected_contents:
+            return False
+    return True
 
 
 def _require_exact_string_dict(value: object, label: str) -> dict[str, object]:
@@ -468,6 +611,7 @@ _TRUSTED_NUMPY_MODULE = np
 _TRUSTED_SYS_MODULE = sys
 _TRUSTED_SYS_GETRECURSIONLIMIT = sys.getrecursionlimit
 _TRUSTED_SYS_BYTEORDER = sys.byteorder
+_TRUSTED_SYS_MODULES = sys.modules
 _TRUSTED_BOOTSTRAP_GLOBAL_BINDINGS = (
     ("CodeType", _TRUSTED_CODE_TYPE, "Unsupported modified CodeType binding"),
     (
@@ -506,11 +650,14 @@ _TRUSTED_NUMPY_BINDINGS = (
     (np, "allclose", np.allclose),
     (np, "any", np.any),
     (np, "argmax", np.argmax),
+    (np, "array", np.array),
     (np, "array_equal", np.array_equal),
+    (np, "asarray", np.asarray),
     (np, "ascontiguousarray", np.ascontiguousarray),
     (np, "dtype", np.dtype),
     (np, "float32", np.float32),
     (np, "float64", np.float64),
+    (np, "int64", np.int64),
     (np, "isfinite", np.isfinite),
     (np, "linspace", np.linspace),
     (np, "ndarray", np.ndarray),
@@ -536,11 +683,13 @@ _TRUSTED_FRAMEWORK_DEFINITIONS = tuple(
     for cls in (
         *_TRUSTED_FRAMEWORK_CLASSES,
         *_TRUSTED_FX_CLASSES,
+        _torch.no_grad,
     )
 )
 _TRUSTED_FUNCTION_BINDINGS = (
     *_TRUSTED_NUMPY_BINDINGS,
     (_torch, "nn", _torch.nn),
+    (_torch, "_C", _torch._C),
     (_torch, "fx", _torch.fx),
     (_torch, "backends", _torch.backends),
     (_torch.backends, "cudnn", _torch.backends.cudnn),
@@ -588,6 +737,7 @@ _TRUSTED_FUNCTION_BINDINGS = (
     (_torch, "relu_", _torch.relu_),
     (_torch, "argmax", _torch.argmax),
     (_torch, "from_numpy", _torch.from_numpy),
+    (_torch, "is_grad_enabled", _torch.is_grad_enabled),
     (_torch, "no_grad", _torch.no_grad),
     (_torch, "get_default_dtype", _torch.get_default_dtype),
     (_torch, "Tensor", _torch.Tensor),
@@ -597,6 +747,7 @@ _TRUSTED_FUNCTION_BINDINGS = (
     (_torch, "int64", _torch.int64),
     (_torch, "preserve_format", _torch.preserve_format),
     (_torch, "strided", _torch.strided),
+    (_torch._C, "_set_grad_enabled", _torch._C._set_grad_enabled),
     (_torch.fx, "symbolic_trace", _torch.fx.symbolic_trace),
     (_torch.Tensor, "argmax", _torch.Tensor.argmax),
     (_torch.Tensor, "dim", _torch.Tensor.dim),
@@ -656,8 +807,11 @@ _TRUSTED_FUNCTION_FINGERPRINTS = tuple(
 del _torch
 
 
-class UnsupportedOpError(RuntimeError):
-    """Raised when the FX graph contains an operation outside the MVP subset."""
+UnsupportedOpError = _errors_component.UnsupportedOpError
+
+
+class _PostCallbackIntegrityError(BaseException):
+    """Internal non-Exception escape used when callback re-attestation fails."""
 
 
 _TRUSTED_UNSUPPORTED_OP_ERROR = UnsupportedOpError
@@ -678,1347 +832,74 @@ def load_model_from_file(path: Path) -> object:
     return model
 
 
-def _parse_model_impl(
-    model: object,
-    input_shape: Sequence[int],
-    input_dtype: object | None,
-    torch: object,
+def _checked_untrusted_call(
+    callback: object,
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
     nn: object,
-) -> GraphIR:
-    normalized_input_shape = _validate_input_shape(input_shape)
-    float_dtype = _validate_model_semantics(model, nn, torch, input_dtype)
-    trace_model = _copy_model_for_tracing(model, nn, torch)
-    instance_state = _snapshot_module_state(trace_model, nn, torch)
-    class_state = _snapshot_module_class_definitions(trace_model, nn)
-    trace_error: Exception | None = None
-    traced: object | None = None
+    security_context: tuple[object, ...],
+    *,
+    disable_grad: bool = False,
+) -> object:
+    (
+        validator,
+        validator_state,
+        state_matcher,
+        state_matcher_code,
+        trusted_type,
+        trusted_function_type,
+        trusted_dict_type,
+        trusted_str_type,
+        trusted_len,
+        trusted_value_error,
+        empty_cell,
+        trusted_error,
+        trusted_base_exception,
+        trusted_integrity_marker,
+        trusted_is_grad_enabled,
+        trusted_set_grad_enabled,
+    ) = security_context
+    integrity_marker = trusted_integrity_marker()
+    callback_error: BaseException | None = None
+    result: object | None = None
+    previous_grad_mode = False
+    if disable_grad:
+        previous_grad_mode = trusted_is_grad_enabled()
+        trusted_set_grad_enabled(False)
     try:
-        traced = torch.fx.symbolic_trace(trace_model)
-    except Exception as exc:
-        trace_error = exc
-    class_state_changed = _restore_module_class_definitions(class_state)
-    instance_state_changed = instance_state != _snapshot_module_state(
-        trace_model,
-        nn,
-        torch,
-    )
-    if class_state_changed or instance_state_changed:
-        raise UnsupportedOpError(
-            "Unsupported Python state mutation during FX symbolic trace"
-        )
-    if trace_error is not None:
-        raise UnsupportedOpError(
-            f"Unsupported FX symbolic trace semantics: {trace_error}"
-        ) from trace_error
-    assert traced is not None
-    traced, transformations = _fuse_conv_batchnorm_eval(traced, nn, torch)
-    has_batchnorm_fusion = bool(transformations)
-    modules = dict(_trusted_named_modules(traced, nn))
-    input_tensor = TensorIR(
-        name="input",
-        shape=normalized_input_shape,
-        dtype=float_dtype,
-    )
-    current_tensor = input_tensor
-    current_node: object | None = None
-    ops: list[object] = []
-    saw_argmax = False
-    saw_output = False
-    source_current_shape = (
-        (1, *normalized_input_shape) if has_batchnorm_fusion else None
-    )
-
-    for node in traced.graph.nodes:
-        if node.op == "placeholder":
-            if current_node is not None:
-                raise UnsupportedOpError(
-                    "Unsupported FX graph: exactly one tensor input is required"
-                )
-            current_node = node
-            continue
-        if node.op == "output":
-            output_node = _parse_output_node(node)
-            if output_node is not current_node:
-                raise UnsupportedOpError(
-                    "Unsupported FX graph: output must be the final node of a "
-                    "single sequential chain"
-                )
-            saw_output = True
-            continue
-        if saw_output:
-            raise UnsupportedOpError("Unsupported FX graph: node found after output")
-        if current_node is None:
-            raise UnsupportedOpError(
-                "Unsupported FX graph: operation appears before the input placeholder"
-            )
-        if saw_argmax:
-            raise UnsupportedOpError(
-                "Unsupported FX graph: argmax must be the final operation"
-            )
-        if node.op == "call_module":
-            _require_sequential_input(node, current_node)
-            module = modules[str(node.target)]
-            if source_current_shape is not None and type(module) is nn.Flatten:
-                start_dim = _module_integer(
-                    _required_module_attribute(module, "Flatten", "start_dim"),
-                    "Flatten",
-                    "start_dim",
-                )
-                end_dim = _module_integer(
-                    _required_module_attribute(module, "Flatten", "end_dim"),
-                    "Flatten",
-                    "end_dim",
-                )
-                try:
-                    source_flatten_shape = _flatten_shape(
-                        source_current_shape,
-                        start_dim,
-                        end_dim,
-                    )
-                    fused_flatten_shape = _flatten_shape(
-                        current_tensor.shape,
-                        start_dim,
-                        end_dim,
-                    )
-                except UnsupportedOpError as exc:
-                    raise UnsupportedOpError(
-                        "Unsupported Flatten with singleton batch adapter: "
-                        "dimensions must be valid for both source NCHW and "
-                        "fused CHW shapes"
-                    ) from exc
-                if source_flatten_shape != (1, *fused_flatten_shape):
-                    raise UnsupportedOpError(
-                        "Unsupported Flatten with singleton batch adapter: source "
-                        f"shape {source_flatten_shape} does not preserve the fused "
-                        f"batchless shape {(1, *fused_flatten_shape)}"
-                    )
-            current_tensor, new_op = _parse_module_node(
-                node_name=_safe_name(str(node.name)),
-                module=module,
-                current_tensor=current_tensor,
-                nn=nn,
-            )
-            if source_current_shape is not None:
-                source_current_shape = (1, *current_tensor.shape)
-            ops.append(new_op)
-            current_node = node
-            continue
-        if node.op == "call_function" and node.target is torch.argmax:
-            _require_sequential_input(node, current_node, allow_parameters=True)
-            _validate_argmax_arguments(node, is_method=False)
-            argmax_input = current_tensor
-            current_tensor = TensorIR(name=_safe_name(str(node.name)), shape=(), dtype="int64")
-            ops.append(
-                ArgmaxIR(
-                    name=_safe_name(str(node.name)),
-                    input=argmax_input,
-                    output=current_tensor,
-                )
-            )
-            saw_argmax = True
-            current_node = node
-            continue
-        if node.op == "call_method" and str(node.target) == "argmax":
-            _require_sequential_input(node, current_node, allow_parameters=True)
-            _validate_argmax_arguments(node, is_method=True)
-            argmax_input = current_tensor
-            current_tensor = TensorIR(name=_safe_name(str(node.name)), shape=(), dtype="int64")
-            ops.append(
-                ArgmaxIR(
-                    name=_safe_name(str(node.name)),
-                    input=argmax_input,
-                    output=current_tensor,
-                )
-            )
-            saw_argmax = True
-            current_node = node
-            continue
-        raise UnsupportedOpError(
-            f"Unsupported FX node/op/module: op={node.op}, target={node.target}"
-        )
-
-    if current_node is None:
-        raise UnsupportedOpError("Unsupported FX graph: missing input placeholder")
-    if not saw_output:
-        raise UnsupportedOpError("Unsupported FX graph: missing output node")
-
-    metadata: dict[str, object] = {"source": type(model).__name__}
-    if has_batchnorm_fusion:
-        metadata["input_adapter"] = {"kind": "singleton_batch_n1"}
-        metadata["transformations"] = transformations
-    graph = GraphIR(
-        input=input_tensor,
-        output=current_tensor,
-        ops=tuple(ops),
-        metadata=metadata,
-    )
-    if has_batchnorm_fusion:
-        _validate_fusion_boundary(
-            source_model=model,
-            fused_model=traced,
-            input_shape=normalized_input_shape,
-            float_dtype=float_dtype,
-            nn=nn,
-            torch=torch,
-        )
-    _validate_lowered_semantics(
-        model=traced if has_batchnorm_fusion else model,
-        graph=graph,
-        input_shape=normalized_input_shape,
-        float_dtype=float_dtype,
-        nn=nn,
-        torch=torch,
-        copy_model=not has_batchnorm_fusion,
-    )
-    return graph
-
-
-def _fuse_conv_batchnorm_eval(
-    traced: object,
-    nn: object,
-    torch: object,
-) -> tuple[object, list[dict[str, str]]]:
-    modules = dict(_trusted_named_modules(traced, nn))
-    candidates: list[tuple[object, object, object, object]] = []
-    for node in tuple(traced.graph.nodes):
-        if node.op != "call_module":
-            continue
-        module = modules.get(str(node.target))
-        if type(module) is not nn.BatchNorm2d:
-            continue
-        args = tuple(node.args)
-        kwargs = dict(node.kwargs)
-        if len(args) != 1 or kwargs or not _is_fx_node(args[0]):
-            raise UnsupportedOpError(
-                f"Unsupported BatchNorm2d call at node {node.name}: expected "
-                "one direct Conv2d tensor input"
-            )
-        conv_node = args[0]
-        conv = (
-            modules.get(str(conv_node.target))
-            if conv_node.op == "call_module"
-            else None
-        )
-        if type(conv) is not nn.Conv2d:
-            raise UnsupportedOpError(
-                f"Unsupported BatchNorm2d at node {node.name}: only an exact "
-                "Conv2d -> BatchNorm2d pattern can be fused"
-            )
-        if _fx_node_use_count(traced.graph, conv_node) != 1:
-            raise UnsupportedOpError(
-                f"Unsupported Conv2d fan-out at node {conv_node.name}: "
-                "fusion requires exactly one FX edge use"
-            )
-        if _fx_node_use_count(traced.graph, node) != 1:
-            raise UnsupportedOpError(
-                f"Unsupported BatchNorm2d fan-out at node {node.name}: "
-                "fusion requires exactly one FX edge use"
-            )
-        candidates.append((conv_node, conv, node, module))
-
-    if not candidates:
-        return traced, []
-
-    _require_eval_module(traced, "root model")
-    transformations: list[dict[str, str]] = []
-    for index, (conv_node, conv, batchnorm_node, batchnorm) in enumerate(candidates):
-        _validate_conv_batchnorm_pair(conv, batchnorm, nn, torch)
         try:
-            fused = torch.nn.utils.fusion.fuse_conv_bn_eval(conv, batchnorm)
-        except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
-            raise UnsupportedOpError(
-                "Unsupported Conv2d -> BatchNorm2d fusion at nodes "
-                f"{conv_node.name} -> {batchnorm_node.name}: {exc}"
-            ) from exc
-        _validate_fused_conv(fused, conv, nn)
-        fused_target = _fresh_fused_target(traced, index)
-        traced.add_module(fused_target, fused)
-        original_conv_target = str(conv_node.target)
-        original_batchnorm_target = str(batchnorm_node.target)
-        conv_node.target = fused_target
-        batchnorm_node.replace_all_uses_with(conv_node)
-        traced.graph.erase_node(batchnorm_node)
-        transformations.append(
-            {
-                "kind": "conv2d_batchnorm2d_fusion",
-                "conv_node": str(conv_node.name),
-                "conv_target": original_conv_target,
-                "batchnorm_node": str(batchnorm_node.name),
-                "batchnorm_target": original_batchnorm_target,
-                "fused_target": fused_target,
-            }
-        )
+            result = callback(*args, **kwargs)
+        except trusted_base_exception as exc:
+            callback_error = exc
+    finally:
+        if disable_grad:
+            # This C-level primitive was copied to the active frame before the
+            # callback. Restoring grad mode completes the controlled adapter;
+            # the consistency check below is the next compiler action.
+            trusted_set_grad_enabled(previous_grad_mode)
 
-    traced.graph.lint()
-    traced.recompile()
-    traced.delete_all_unused_submodules()
-    traced.graph.lint()
-    traced.recompile()
-    remaining_modules = dict(_trusted_named_modules(traced, nn))
-    for node in traced.graph.nodes:
-        if node.op == "call_module" and type(
-            remaining_modules.get(str(node.target))
-        ) is nn.BatchNorm2d:
-            raise UnsupportedOpError(
-                f"Unsupported unfused BatchNorm2d at FX node {node.name}"
-            )
-    return traced, transformations
-
-
-def _validate_conv_batchnorm_pair(
-    conv: object,
-    batchnorm: object,
-    nn: object,
-    torch: object,
-) -> None:
-    if type(conv) is not nn.Conv2d or type(batchnorm) is not nn.BatchNorm2d:
-        raise UnsupportedOpError(
-            "Unsupported fusion module types: exact Conv2d and BatchNorm2d "
-            "instances are required"
-        )
-    conv_state = _raw_module_state(conv)
-    if {"weight", "bias"}.intersection(conv_state):
-        raise UnsupportedOpError(
-            "Unsupported Conv2d instance schema: parameter slots must not be "
-            "shadowed by direct attributes"
-        )
-    _require_eval_module(conv, "Conv2d")
-    _require_eval_module(batchnorm, "BatchNorm2d")
-
-    out_channels = _positive_module_integer(
-        _required_module_attribute(conv, "Conv2d", "out_channels"),
-        "Conv2d",
-        "out_channels",
-    )
-    num_features = _positive_module_integer(
-        _required_module_attribute(batchnorm, "BatchNorm2d", "num_features"),
-        "BatchNorm2d",
-        "num_features",
-    )
-    if num_features != out_channels:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d num_features: expected Conv2d "
-            f"out_channels={out_channels}, got {num_features}"
-        )
-
-    state = _raw_module_state(batchnorm)
-    parameters = state.get("_parameters")
-    buffers = state.get("_buffers")
-    children = state.get("_modules")
-    registry_names = {
-        "weight",
-        "bias",
-        "running_mean",
-        "running_var",
-        "num_batches_tracked",
-    }
-    shadowed_names = registry_names.intersection(state)
-    if shadowed_names:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d instance schema: parameter and buffer "
-            "slots must not be shadowed by direct attributes"
-        )
-    if type(children) is not dict or children:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d module schema: child modules are not allowed"
-        )
-    if type(parameters) is not dict or set(parameters) != {"weight", "bias"}:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d parameter schema: expected exactly "
-            "weight and bias slots"
-        )
-    expected_buffers = {"running_mean", "running_var", "num_batches_tracked"}
-    if type(buffers) is not dict or set(buffers) != expected_buffers:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d buffer schema: expected exactly "
-            "running_mean, running_var, and num_batches_tracked slots"
-        )
-    non_persistent = state.get("_non_persistent_buffers_set")
-    if type(non_persistent) is not set or non_persistent:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d buffer schema: running statistics must "
-            "be persistent"
-        )
-
-    affine = _required_module_attribute(batchnorm, "BatchNorm2d", "affine")
-    if type(affine) is not bool:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d affine: expected a built-in boolean"
-        )
-    weight = parameters["weight"]
-    bias = parameters["bias"]
-    if affine:
-        weight = _required_parameter(weight, "BatchNorm2d", "weight", nn)
-        try:
-            constructor = _raw_static_attribute(nn.BatchNorm2d, "__init__")
-        except AttributeError as exc:
-            raise UnsupportedOpError(
-                "Unsupported BatchNorm2d constructor metadata"
-            ) from exc
-        if type(constructor) is not FunctionType:
-            raise UnsupportedOpError(
-                "Unsupported BatchNorm2d constructor metadata"
-            )
-        constructor_code = constructor.__code__
-        kwonly_start = constructor_code.co_argcount
-        kwonly_stop = kwonly_start + constructor_code.co_kwonlyargcount
-        kwdefaults = constructor.__kwdefaults__
-        supports_optional_bias = (
-            "bias" in constructor_code.co_varnames[kwonly_start:kwonly_stop]
-            and type(kwdefaults) is dict
-            and kwdefaults.get("bias") is True
-        )
-        if supports_optional_bias:
-            bias = _optional_parameter(bias, "BatchNorm2d", "bias", nn)
-        else:
-            bias = _required_parameter(bias, "BatchNorm2d", "bias", nn)
-    elif weight is not None or bias is not None:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d parameter schema: affine=False requires "
-            "empty weight and bias slots"
-        )
-
-    track_running_stats = _required_module_attribute(
-        batchnorm,
-        "BatchNorm2d",
-        "track_running_stats",
-    )
-    if type(track_running_stats) is not bool or not track_running_stats:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d track_running_stats: running statistics "
-            "are required for eval fusion"
-        )
-    running_mean = buffers["running_mean"]
-    running_var = buffers["running_var"]
-    counter = buffers["num_batches_tracked"]
-    for name, tensor in (
-        ("running_mean", running_mean),
-        ("running_var", running_var),
+    # This is deliberately the first trusted action after callback return or
+    # raise. The active frame still executes its original code object, and all
+    # values below were copied to fast locals before entering user code.
+    if state_matcher.__code__ is not state_matcher_code or not state_matcher(
+        validator,
+        validator_state,
+        trusted_type,
+        trusted_function_type,
+        trusted_dict_type,
+        trusted_str_type,
+        trusted_len,
+        trusted_value_error,
+        empty_cell,
     ):
-        if type(tensor) is not torch.Tensor:
-            raise UnsupportedOpError(
-                f"Unsupported BatchNorm2d {name}: expected a Tensor"
-            )
-        if tuple(tensor.shape) != (num_features,):
-            raise UnsupportedOpError(
-                f"Unsupported BatchNorm2d {name} shape: expected "
-                f"({num_features},), got {tuple(tensor.shape)}"
-            )
-        if tensor.requires_grad:
-            raise UnsupportedOpError(
-                f"Unsupported BatchNorm2d {name}: buffers must not require gradients"
-            )
-    if (
-        type(counter) is not torch.Tensor
-        or counter.dtype is not torch.int64
-        or tuple(counter.shape) != ()
-        or counter.requires_grad
-    ):
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d num_batches_tracked: expected a "
-            "non-gradient scalar int64 Tensor"
-        )
-    counter_value = int(counter.detach().cpu().numpy().item())
-    if counter_value < 0:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d num_batches_tracked: expected a "
-            "non-negative value"
-        )
-
-    expected_shape = (num_features,)
-    for name, tensor in (("weight", weight), ("bias", bias)):
-        if tensor is not None and tuple(tensor.shape) != expected_shape:
-            raise UnsupportedOpError(
-                f"Unsupported BatchNorm2d {name} shape: expected "
-                f"{expected_shape}, got {tuple(tensor.shape)}"
-            )
-
-    conv_weight = _required_parameter(
-        _required_module_attribute(conv, "Conv2d", "weight"),
-        "Conv2d",
-        "weight",
-        nn,
-    )
-    conv_bias = _optional_parameter(
-        _required_module_attribute(conv, "Conv2d", "bias"),
-        "Conv2d",
-        "bias",
-        nn,
-    )
-    floating_tensors = [conv_weight, running_mean, running_var]
-    floating_tensors.extend(
-        tensor for tensor in (conv_bias, weight, bias) if tensor is not None
-    )
-    dtype = conv_weight.dtype
-    if dtype not in (torch.float32, torch.float64) or any(
-        tensor.dtype is not dtype for tensor in floating_tensors
-    ):
-        raise UnsupportedOpError(
-            "Unsupported Conv2d/BatchNorm2d dtype: all fusion parameters and "
-            "statistics must use one float32 or float64 dtype"
-        )
-    for name, tensor in (
-        ("Conv2d weight", conv_weight),
-        ("Conv2d bias", conv_bias),
-        ("BatchNorm2d weight", weight),
-        ("BatchNorm2d bias", bias),
-        ("BatchNorm2d running_mean", running_mean),
-        ("BatchNorm2d running_var", running_var),
-    ):
-        if tensor is not None and not _tensor_values_are_finite(tensor):
-            raise UnsupportedOpError(
-                f"Unsupported {name}: fusion inputs must contain only finite values"
-            )
-
-    eps = _required_module_attribute(batchnorm, "BatchNorm2d", "eps")
-    if type(eps) is not float or not math.isfinite(eps) or eps < 0.0:
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d eps: expected a finite non-negative "
-            "built-in float"
-        )
-    running_var_values = running_var.detach().cpu().numpy()
-    if np.any(running_var_values < 0):
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d running_var: values must be non-negative"
-        )
-    variance_with_eps = (running_var + eps).detach().cpu().numpy()
-    if not np.all(np.isfinite(variance_with_eps)) or np.any(variance_with_eps <= 0):
-        raise UnsupportedOpError(
-            "Unsupported BatchNorm2d running_var + eps: every channel must "
-            "have a finite positive denominator"
-        )
-
-
-def _require_eval_module(module: object, label: str) -> None:
-    training = _required_module_attribute(module, label, "training")
-    if type(training) is not bool or training:
-        raise UnsupportedOpError(
-            f"Unsupported {label} training state: Conv2d/BatchNorm2d fusion "
-            "requires eval mode"
-        )
-
-
-def _validate_fused_conv(
-    fused: object,
-    source_conv: object,
-    nn: object,
-) -> None:
-    if type(fused) is not nn.Conv2d:
-        raise UnsupportedOpError(
-            "Unsupported official fusion result: expected an exact Conv2d"
-        )
-    weight = _required_parameter(
-        _required_module_attribute(fused, "fused Conv2d", "weight"),
-        "fused Conv2d",
-        "weight",
-        nn,
-    )
-    bias = _required_parameter(
-        _required_module_attribute(fused, "fused Conv2d", "bias"),
-        "fused Conv2d",
-        "bias",
-        nn,
-    )
-    source_weight = _required_parameter(
-        _required_module_attribute(source_conv, "Conv2d", "weight"),
-        "Conv2d",
-        "weight",
-        nn,
-    )
-    if weight.dtype is not source_weight.dtype or bias.dtype is not source_weight.dtype:
-        raise UnsupportedOpError(
-            "Unsupported official fusion result: fused parameter dtype changed"
-        )
-    if not _tensor_values_are_finite(weight) or not _tensor_values_are_finite(bias):
-        raise UnsupportedOpError(
-            "Unsupported official fusion result: fused Conv2d parameters "
-            "must contain only finite values"
-        )
-    _require_eval_module(fused, "fused Conv2d")
-
-
-def _tensor_values_are_finite(tensor: object) -> bool:
-    values = tensor.detach().cpu().numpy()
-    return bool(np.all(np.isfinite(values)))
-
-
-def _fresh_fused_target(traced: object, index: int) -> str:
-    base = f"_torch2rtl_fused_conv_bn_{index}"
-    candidate = base
-    suffix = 0
-    state = _raw_module_state(traced)
-    modules = state.get("_modules")
-    if type(modules) is not dict:
-        raise UnsupportedOpError("Unsupported FX GraphModule module registry")
-    while candidate in state or candidate in modules or hasattr(traced, candidate):
-        suffix += 1
-        candidate = f"{base}_{suffix}"
-    return candidate
-
-
-def _fx_node_use_count(graph: object, target: object) -> int:
-    count = 0
-    for node in graph.nodes:
-        count += _fx_value_reference_count(node.args, target)
-        count += _fx_value_reference_count(node.kwargs, target)
-    return count
-
-
-def _fx_value_reference_count(value: object, target: object) -> int:
-    if value is target:
-        return 1
-    if isinstance(value, (tuple, list)):
-        count = 0
-        for item in value:
-            count += _fx_value_reference_count(item, target)
-        return count
-    if isinstance(value, dict):
-        count = 0
-        for key, item in value.items():
-            count += _fx_value_reference_count(key, target)
-            count += _fx_value_reference_count(item, target)
-        return count
-    if type(value) is slice:
-        count = 0
-        for item in (value.start, value.stop, value.step):
-            count += _fx_value_reference_count(item, target)
-        return count
-    return 0
-
-
-def _parse_module_node(
-    node_name: str,
-    module: object,
-    current_tensor: TensorIR,
-    nn: object,
-) -> tuple[TensorIR, object]:
-    if isinstance(module, nn.Linear):
-        module_in_features = _positive_module_integer(
-            _required_module_attribute(module, "Linear", "in_features"),
-            "Linear",
-            "in_features",
-        )
-        module_out_features = _positive_module_integer(
-            _required_module_attribute(module, "Linear", "out_features"),
-            "Linear",
-            "out_features",
-        )
-        weight = _required_parameter(
-            _required_module_attribute(module, "Linear", "weight"),
-            "Linear",
-            "weight",
-            nn,
-        )
-        bias = _optional_parameter(
-            _required_module_attribute(module, "Linear", "bias"),
-            "Linear",
-            "bias",
-            nn,
-        )
-        if len(current_tensor.shape) != 1:
-            raise UnsupportedOpError(
-                "Unsupported Linear input shape: only a 1-D feature vector is "
-                f"supported, got {current_tensor.shape}; flatten explicitly first"
-            )
-        in_features = int(current_tensor.shape[0])
-        if in_features != module_in_features:
-            raise UnsupportedOpError(
-                "Unsupported Linear input shape: "
-                f"expected ({module.in_features},), got {current_tensor.shape}"
-            )
-        expected_weight_shape = (module_out_features, module_in_features)
-        if tuple(weight.shape) != expected_weight_shape:
-            raise UnsupportedOpError(
-                "Unsupported Linear weight shape: "
-                f"expected {expected_weight_shape}, got {tuple(weight.shape)}"
-            )
-        if bias is not None and tuple(bias.shape) != (
-            module_out_features,
-        ):
-            raise UnsupportedOpError(
-                "Unsupported Linear bias shape: "
-                f"expected ({module.out_features},), got {tuple(module.bias.shape)}"
-            )
-        output_shape = (module_out_features,)
-        output = TensorIR(
-            name=f"{node_name}_out",
-            shape=output_shape,
-            dtype=current_tensor.dtype,
-        )
-        bias_values = None
-        if bias is not None:
-            bias_values = bias.detach().cpu().numpy().copy()
-        op = LinearIR(
-            name=node_name,
-            input=current_tensor,
-            output=output,
-            in_features=module_in_features,
-            out_features=module_out_features,
-            weight=weight.detach().cpu().numpy().copy(),
-            bias=bias_values,
-        )
-        return output, op
-
-    if isinstance(module, nn.Conv2d):
-        module_in_channels = _positive_module_integer(
-            _required_module_attribute(module, "Conv2d", "in_channels"),
-            "Conv2d",
-            "in_channels",
-        )
-        module_out_channels = _positive_module_integer(
-            _required_module_attribute(module, "Conv2d", "out_channels"),
-            "Conv2d",
-            "out_channels",
-        )
-        groups = _positive_module_integer(
-            _required_module_attribute(module, "Conv2d", "groups"),
-            "Conv2d",
-            "groups",
-        )
-        weight = _required_parameter(
-            _required_module_attribute(module, "Conv2d", "weight"),
-            "Conv2d",
-            "weight",
-            nn,
-        )
-        bias = _optional_parameter(
-            _required_module_attribute(module, "Conv2d", "bias"),
-            "Conv2d",
-            "bias",
-            nn,
-        )
-        if len(current_tensor.shape) == 4:
-            raise UnsupportedOpError(
-                "Unsupported Conv2d input: batch dimension is not supported; "
-                "use unbatched (C, H, W)"
-            )
-        if len(current_tensor.shape) != 3:
-            raise UnsupportedOpError(
-                f"Unsupported Conv2d input rank: expected (C, H, W), got {current_tensor.shape}"
-            )
-        if groups != 1:
-            raise UnsupportedOpError("Unsupported Conv2d groups: only groups=1 is supported")
-        padding_mode = _required_module_attribute(module, "Conv2d", "padding_mode")
-        if type(padding_mode) is not str or padding_mode != "zeros":
-            raise UnsupportedOpError(
-                "Unsupported Conv2d padding_mode: only zero padding is supported"
-            )
-        dilation = _int_pair(
-            _required_module_attribute(module, "Conv2d", "dilation"),
-            "dilation",
-        )
-        if dilation != (1, 1):
-            raise UnsupportedOpError("Unsupported Conv2d dilation: only dilation=1 is supported")
-        padding = _int_pair(
-            _required_module_attribute(module, "Conv2d", "padding"),
-            "padding",
-        )
-        stride = _int_pair(
-            _required_module_attribute(module, "Conv2d", "stride"),
-            "stride",
-        )
-        kernel_height, kernel_width = _int_pair(
-            _required_module_attribute(module, "Conv2d", "kernel_size"),
-            "kernel_size",
-        )
-        _validate_conv_pair("kernel_size", (kernel_height, kernel_width), minimum=1)
-        _validate_conv_pair("stride", stride, minimum=1)
-        _validate_conv_pair("padding", padding, minimum=0)
-        for attribute_name, values in (
-            ("kernel_size", (kernel_height, kernel_width)),
-            ("stride", stride),
-            ("padding", padding),
-        ):
-            if any(value > _SV_INT_MAX for value in values):
-                raise UnsupportedOpError(
-                    f"Unsupported Conv2d {attribute_name}: values must fit a "
-                    "signed 32-bit SystemVerilog int"
-                )
-        in_channels, input_height, input_width = (int(dim) for dim in current_tensor.shape)
-        if in_channels != module_in_channels:
-            raise UnsupportedOpError(
-                "Unsupported Conv2d shape: "
-                f"expected {module.in_channels} input channels, got {in_channels}"
-            )
-        output_height = _conv_output_dim(input_height, kernel_height, stride[0], padding[0])
-        output_width = _conv_output_dim(input_width, kernel_width, stride[1], padding[1])
-        if output_height <= 0 or output_width <= 0:
-            raise UnsupportedOpError(
-                "Unsupported Conv2d output shape: "
-                f"got ({module.out_channels}, {output_height}, {output_width})"
-            )
-        _validate_tensor_element_count(
-            (module_out_channels, output_height, output_width),
-            "Conv2d output",
-        )
-        for output_size, step, kernel_size in (
-            (output_height, stride[0], kernel_height),
-            (output_width, stride[1], kernel_width),
-        ):
-            maximum_positive_coordinate = (output_size - 1) * step + kernel_size - 1
-            if maximum_positive_coordinate > _SV_INT_MAX:
-                raise UnsupportedOpError(
-                    "Unsupported Conv2d coordinates: index arithmetic must fit a "
-                    "signed 32-bit SystemVerilog int"
-                )
-        expected_weight_shape = (
-            module_out_channels,
-            in_channels,
-            kernel_height,
-            kernel_width,
-        )
-        actual_weight_shape = tuple(int(dim) for dim in weight.shape)
-        if actual_weight_shape != expected_weight_shape:
-            raise UnsupportedOpError(
-                "Unsupported Conv2d weight shape: "
-                f"expected {expected_weight_shape}, got {actual_weight_shape}"
-            )
-        if bias is not None and tuple(bias.shape) != (
-            module_out_channels,
-        ):
-            raise UnsupportedOpError(
-                "Unsupported Conv2d bias shape: "
-                f"expected ({module.out_channels},), got {tuple(module.bias.shape)}"
-            )
-        output = TensorIR(
-            name=f"{node_name}_out",
-            shape=(module_out_channels, output_height, output_width),
-            dtype=current_tensor.dtype,
-        )
-        bias_values = None
-        if bias is not None:
-            bias_values = bias.detach().cpu().numpy().copy()
-        op = Conv2dIR(
-            name=node_name,
-            input=current_tensor,
-            output=output,
-            in_channels=in_channels,
-            out_channels=module_out_channels,
-            input_height=input_height,
-            input_width=input_width,
-            output_height=output_height,
-            output_width=output_width,
-            kernel_height=kernel_height,
-            kernel_width=kernel_width,
-            stride=stride,
-            padding=padding,
-            weight=weight.detach().cpu().numpy().copy(),
-            bias=bias_values,
-        )
-        return output, op
-
-    if isinstance(module, nn.ReLU):
-        inplace = _required_module_attribute(module, "ReLU", "inplace")
-        if type(inplace) is not bool:
-            raise UnsupportedOpError(
-                "Unsupported ReLU inplace: expected a built-in boolean"
-            )
-        if inplace:
-            raise UnsupportedOpError(
-                "Unsupported ReLU inplace=True: input mutation is not lowered"
-            )
-        output = TensorIR(
-            name=f"{node_name}_out",
-            shape=current_tensor.shape,
-            dtype=current_tensor.dtype,
-        )
-        return output, ReluIR(name=node_name, input=current_tensor, output=output)
-
-    if isinstance(module, nn.Flatten):
-        start_dim = _module_integer(
-            _required_module_attribute(module, "Flatten", "start_dim"),
-            "Flatten",
-            "start_dim",
-        )
-        end_dim = _module_integer(
-            _required_module_attribute(module, "Flatten", "end_dim"),
-            "Flatten",
-            "end_dim",
-        )
-        output_shape = _flatten_shape(
-            shape=current_tensor.shape,
-            start_dim=start_dim,
-            end_dim=end_dim,
-        )
-        if len(output_shape) != 1:
-            raise UnsupportedOpError(
-                "Unsupported Flatten: only flattening the complete tensor to one "
-                f"dimension is supported, got output shape {output_shape}"
-            )
-        output = TensorIR(
-            name=f"{node_name}_out",
-            shape=output_shape,
-            dtype=current_tensor.dtype,
-        )
-        return output, FlattenIR(name=node_name, input=current_tensor, output=output)
-
-    raise UnsupportedOpError(
-        f"Unsupported FX node/op/module: module={type(module).__name__}"
-    )
-
-
-def _flatten_shape(shape: tuple[int, ...], start_dim: int, end_dim: int) -> tuple[int, ...]:
-    rank = len(shape)
-    if rank == 0:
-        return shape
-    if start_dim < 0:
-        start_dim += rank
-    if end_dim < 0:
-        end_dim += rank
-    if start_dim < 0 or end_dim >= rank or start_dim > end_dim:
-        raise UnsupportedOpError(
-            f"Unsupported Flatten dims: start_dim={start_dim}, end_dim={end_dim}"
-        )
-    flattened = math.prod(shape[start_dim : end_dim + 1])
-    return (*shape[:start_dim], flattened, *shape[end_dim + 1 :])
-
-
-def _validate_model_semantics(
-    model: object,
-    nn: object,
-    torch: object,
-    input_dtype: object | None,
-) -> str:
-    if not isinstance(model, nn.Module):
-        raise UnsupportedOpError(
-            f"Unsupported model type: expected torch.nn.Module, got {type(model).__name__}"
-        )
-
-    module_api = torch.nn.modules.module
-    for registry_name in (
-        "_global_buffer_registration_hooks",
-        "_global_module_registration_hooks",
-        "_global_parameter_registration_hooks",
-        "_global_backward_pre_hooks",
-        "_global_backward_hooks",
-        "_global_forward_pre_hooks",
-        "_global_forward_hooks",
-        "_global_forward_hooks_always_called",
-        "_global_forward_hooks_with_kwargs",
-    ):
-        registry = getattr(module_api, registry_name, {})
-        if registry:
-            raise UnsupportedOpError(
-                f"Unsupported global hook registry {registry_name}: "
-                "hook semantics are not lowered"
-            )
-
-    lowered_types = (nn.Linear, nn.Conv2d, nn.BatchNorm2d, nn.ReLU, nn.Flatten)
-    modules = tuple(_trusted_named_modules(model, nn))
-    for module_name, module in modules:
-        display_name = module_name or "<root>"
-        module_type = type(module)
-        if type(module_type) is not type:
-            type_name = type.__getattribute__(module_type, "__name__")
-            raise UnsupportedOpError(
-                f"Unsupported custom metaclass on module type {type_name}"
-            )
-        state = _raw_module_state(module)
-        _validate_module_dispatch(module, display_name, nn)
-        _validate_no_custom_copy_protocol(type(module), nn)
-        _validate_no_custom_class_state(type(module), nn)
-        _validate_copy_safe_instance_state(module, display_name, torch)
-        _validate_forward_python_state(type(module), nn, torch)
-        if state.get("_forward_hooks"):
-            raise UnsupportedOpError(
-                f"Unsupported forward hook on module {display_name}: "
-                "hook semantics are not lowered"
-            )
-        if state.get("_forward_pre_hooks"):
-            raise UnsupportedOpError(
-                f"Unsupported forward pre-hook on module {display_name}: "
-                "hook semantics are not lowered"
-            )
-        if state.get("_backward_hooks") or state.get("_backward_pre_hooks"):
-            raise UnsupportedOpError(
-                f"Unsupported backward hook on module {display_name}: "
-                "hook semantics are not lowered"
-            )
-        if isinstance(module, lowered_types):
-            if type(module) not in lowered_types:
-                raise UnsupportedOpError(
-                    f"Unsupported module subclass {type(module).__name__}: "
-                    "custom forward semantics are not lowered"
-                )
-
-    supported = {
-        torch.float32: "float32",
-        torch.float64: "float64",
-    }
-    model_dtypes: set[object] = set()
-    for tensor_name, tensor, is_batchnorm_counter in _trusted_named_tensors(
-        modules,
-        torch,
-    ):
-        if is_batchnorm_counter:
-            continue
-        if tensor.dtype not in supported:
-            raise UnsupportedOpError(
-                f"Unsupported dtype {tensor.dtype} for tensor {tensor_name}; "
-                "only float32 and float64 are supported"
-            )
-        model_dtypes.add(tensor.dtype)
-    if len(model_dtypes) > 1:
-        names = ", ".join(sorted(str(dtype) for dtype in model_dtypes))
-        raise UnsupportedOpError(
-            f"Unsupported mixed model dtypes: {names}; use one floating dtype"
-        )
-
-    requested_dtype = _normalize_float_dtype(input_dtype, torch, supported)
-    model_dtype = next(iter(model_dtypes), None)
-    if requested_dtype is not None and model_dtype is not None and requested_dtype != model_dtype:
-        raise UnsupportedOpError(
-            f"Unsupported input dtype {requested_dtype} for model dtype {model_dtype}"
-        )
-    resolved = requested_dtype or model_dtype or torch.get_default_dtype()
-    if resolved not in supported:
-        raise UnsupportedOpError(
-            f"Unsupported dtype {resolved}; only float32 and float64 are supported"
-        )
-    for module_name, module in modules:
-        _validate_no_custom_introspection(module, module_name or "<root>", nn)
-    return supported[resolved]
-
-
-def _validate_module_dispatch(
-    module: object,
-    display_name: str,
-    nn: object,
-) -> None:
-    module_type = type(module)
-    state = _raw_module_state(module)
-    for attribute in (
-        "__call__",
-        "_wrapped_call_impl",
-        "_call_impl",
-        "_compiled_call_impl",
-    ):
-        if _raw_static_attribute(module_type, attribute) is not _raw_static_attribute(
-            nn.Module,
-            attribute,
-        ):
-            label = "compiled call" if attribute == "_compiled_call_impl" else "call"
-            raise UnsupportedOpError(
-                f"Unsupported custom {label} path ({attribute}) on module "
-                f"{display_name}: call semantics are not lowered"
-            )
-        if attribute in state:
-            raise UnsupportedOpError(
-                f"Unsupported instance call override ({attribute}) on module "
-                f"{display_name}: call semantics are not lowered"
-            )
-    for attribute in ("__getattribute__", "__getattr__"):
-        if _raw_static_attribute(module_type, attribute) is not _raw_static_attribute(
-            nn.Module,
-            attribute,
-        ):
-            raise UnsupportedOpError(
-                f"Unsupported custom call path ({attribute}) on module "
-                f"{display_name}: call semantics are not lowered"
-            )
-    if "forward" in state:
-        raise UnsupportedOpError(
-            f"Unsupported instance forward override on module {display_name}"
-        )
-
-
-def _validate_no_custom_introspection(
-    module: object,
-    display_name: str,
-    nn: object,
-) -> None:
-    state = _raw_module_state(module)
-    for attribute in (
-        "named_modules",
-        "named_parameters",
-        "named_buffers",
-        "named_children",
-        "modules",
-        "parameters",
-        "buffers",
-        "children",
-    ):
-        if _raw_static_attribute(type(module), attribute) is not _raw_static_attribute(
-            nn.Module,
-            attribute,
-        ) or attribute in state:
-            raise UnsupportedOpError(
-                f"Unsupported module introspection override ({attribute}) on "
-                f"module {display_name}"
-            )
-
-
-def _copy_model_for_tracing(model: object, nn: object, torch: object) -> object:
-    before_state = _snapshot_module_state(model, nn, torch)
-    class_state = _snapshot_module_class_definitions(model, nn)
+        raise integrity_marker
     try:
-        copied = copy.deepcopy(model)
-    except Exception as exc:
-        _restore_module_class_definitions(class_state)
-        raise UnsupportedOpError(
-            f"Unsupported model state: model cannot be copied safely for FX trace: {exc}"
-        ) from exc
-    class_changed = _restore_module_class_definitions(class_state)
-    original_changed = before_state != _snapshot_module_state(model, nn, torch)
-    if class_changed or original_changed:
-        raise UnsupportedOpError(
-            "Unsupported model copy: deepcopy mutated Python module state"
-        )
-    if not isinstance(copied, nn.Module):
-        raise UnsupportedOpError(
-            "Unsupported model copy: deepcopy did not return an nn.Module"
-        )
-    if before_state != _snapshot_module_state(copied, nn, torch):
-        raise UnsupportedOpError(
-            "Unsupported model copy: deepcopy changed or substituted module semantics"
-        )
-    return copied
-
-
-def _validate_no_custom_copy_protocol(module_type: type[object], nn: object) -> None:
-    protocol_names = {
-        "__deepcopy__",
-        "__reduce__",
-        "__reduce_ex__",
-        "__getstate__",
-        "__setstate__",
-        "__getnewargs__",
-        "__getnewargs_ex__",
-    }
-    framework_classes = _framework_module_classes(nn)
-    for cls in module_type.__mro__:
-        if cls in framework_classes:
-            break
-        for name in protocol_names & vars(cls).keys():
-            raise UnsupportedOpError(
-                f"Unsupported custom model copy protocol {cls.__name__}.{name}"
-            )
-
-
-def _validate_no_custom_class_state(root_type: type[object], nn: object) -> None:
-    metadata_names = {"__module__", "__qualname__", "__doc__"}
-    framework_classes = _framework_module_classes(nn)
-    for cls in root_type.__mro__:
-        if cls in framework_classes:
-            break
-        for name, value in vars(cls).items():
-            if name in metadata_names:
-                continue
-            if name == "__annotations__" and type(value) is dict and not value:
-                continue
-            if type(value) in (staticmethod, classmethod):
-                continue
-            if isinstance(value, FunctionType):
-                if name == "__init__" or not (
-                    name.startswith("__") and name.endswith("__")
-                ):
-                    continue
-                raise UnsupportedOpError(
-                    f"Unsupported custom class descriptor {cls.__name__}.{name}"
-                )
-            raise UnsupportedOpError(
-                f"Unsupported custom class-level state or descriptor "
-                f"{cls.__name__}.{name}"
-            )
-
-
-def _validate_forward_python_state(
-    module_type: type[object],
-    nn: object,
-    torch: object,
-) -> None:
-    framework_classes = _framework_module_classes(nn)
-    for cls in module_type.__mro__:
-        if cls in framework_classes:
-            break
-        forward = vars(cls).get("forward")
-        if forward is None:
-            continue
-        _validate_reachable_python_function(
-            function=forward,
-            label=f"{cls.__name__}.forward",
-            module_type=module_type,
-            nn=nn,
-            torch=torch,
-            seen=set(),
-        )
-
-
-def _validate_reachable_python_function(
-    function: object,
-    label: str,
-    module_type: type[object],
-    nn: object,
-    torch: object,
-    seen: set[int],
-) -> None:
-    if not isinstance(function, FunctionType):
-        raise UnsupportedOpError(f"Unsupported callable descriptor in {label}")
-    identity = id(function)
-    if identity in seen:
-        return
-    seen.add(identity)
-    if "__wrapped__" in function.__dict__:
-        raise UnsupportedOpError(f"Unsupported decorated function {label}")
-    if function.__dict__:
-        raise UnsupportedOpError(f"Unsupported custom function state in {label}")
-    if function.__builtins__ is not _TRUSTED_BUILTINS:
-        raise UnsupportedOpError(f"Unsupported custom builtins mapping in {label}")
-    if builtins.len is not _TRUSTED_LEN:
-        raise UnsupportedOpError(f"Unsupported modified builtins binding in {label}")
-    if any(_contains_code_object(value) for value in function.__code__.co_consts):
-        raise UnsupportedOpError(f"Unsupported nested code object in {label}")
-    if any(
-        not _is_immutable_python_state(value, set())
-        for value in function.__code__.co_consts
-    ):
-        raise UnsupportedOpError(f"Unsupported code constant in {label}")
-    defaults = (
-        *tuple(function.__defaults__ or ()),
-        *tuple((function.__kwdefaults__ or {}).values()),
-    )
-    if any(not _is_immutable_python_state(value, set()) for value in defaults):
-        raise UnsupportedOpError(f"Unsupported external Python state in {label} defaults")
-    if function.__closure__ is not None:
-        for cell in function.__closure__:
-            try:
-                value = cell.cell_contents
-            except ValueError:
-                continue
-            if not _is_immutable_python_state(value, set()):
-                raise UnsupportedOpError(f"Unsupported external Python state in {label}")
-    bytecode = dis.Bytecode(function)
-    if bytecode.exception_entries:
-        raise UnsupportedOpError(f"Unsupported exception handling in {label}")
-    instructions = tuple(bytecode)
-    for instruction in instructions:
-        if instruction.opname == "FORMAT_VALUE":
-            raise UnsupportedOpError(
-                f"Unsupported tensor-dependent string formatting in {label}"
-            )
-        if instruction.opname in {"STORE_GLOBAL", "DELETE_GLOBAL"}:
-            raise UnsupportedOpError(f"Unsupported external Python state in {label}")
-        if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
-            continue
-        method_name = str(instruction.argval)
-        if method_name in {"format", "node", "tracer"}:
-            raise UnsupportedOpError(
-                f"Unsupported Python introspection/string formatting attribute "
-                f"{method_name!r} in {label}"
-            )
-        if method_name in {"_parameters", "_buffers", "_modules"}:
-            raise UnsupportedOpError(
-                f"Unsupported internal module registry access {method_name!r} in {label}"
-            )
-        if method_name.startswith("__") and method_name.endswith("__"):
-            raise UnsupportedOpError(
-                f"Unsupported Python introspection attribute {method_name!r} in {label}"
-            )
-    if any(
-        instruction.opcode in dis.hasjabs or instruction.opcode in dis.hasjrel
-        for instruction in instructions
-    ):
-        raise UnsupportedOpError(
-            "Unsupported FX symbolic trace control flow/state semantics in "
-            f"{label}"
-        )
-    supported_opcodes = {
-        "BINARY_OP",
-        "BUILD_TUPLE",
-        "CACHE",
-        "CALL",
-        "COPY_FREE_VARS",
-        "EXTENDED_ARG",
-        "KW_NAMES",
-        "LOAD_ATTR",
-        "LOAD_CONST",
-        "LOAD_DEREF",
-        "LOAD_FAST",
-        "LOAD_GLOBAL",
-        "LOAD_METHOD",
-        "NOP",
-        "POP_TOP",
-        "PRECALL",
-        "PUSH_NULL",
-        "RESUME",
-        "RETURN_VALUE",
-        "STORE_FAST",
-    }
-    for index, instruction in enumerate(instructions):
-        if instruction.opname == "FORMAT_VALUE":
-            raise UnsupportedOpError(
-                f"Unsupported tensor-dependent string formatting in {label}"
-            )
-        if instruction.opname == "BINARY_OP" and instruction.argrepr == "%":
-            raise UnsupportedOpError(
-                f"Unsupported tensor-dependent string formatting in {label}"
-            )
-        if instruction.opname in {"STORE_GLOBAL", "DELETE_GLOBAL"}:
-            raise UnsupportedOpError(f"Unsupported external Python state in {label}")
-        if instruction.opname not in supported_opcodes:
-            raise UnsupportedOpError(
-                f"Unsupported custom Python bytecode {instruction.opname} in {label}"
-            )
-        if instruction.opname == "LOAD_GLOBAL":
-            name = str(instruction.argval)
-            if name not in function.__globals__:
-                if name == "len":
-                    continue
-                raise UnsupportedOpError(
-                    f"Unsupported external Python state {name!r} in {label}"
-                )
-            value = function.__globals__[name]
-            if value is torch and _next_loaded_attribute(instructions, index) == "argmax":
-                continue
-            raise UnsupportedOpError(
-                f"Unsupported external Python state {name!r} in {label}"
-            )
-        if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
-            continue
-        method_name = str(instruction.argval)
-        if method_name in {"format", "node", "tracer"}:
-            raise UnsupportedOpError(
-                f"Unsupported Python introspection/string formatting attribute "
-                f"{method_name!r} in {label}"
-            )
-        if method_name in {"_parameters", "_buffers", "_modules"}:
-            raise UnsupportedOpError(
-                f"Unsupported internal module registry access {method_name!r} in {label}"
-            )
-        if method_name.startswith("__") and method_name.endswith("__"):
-            raise UnsupportedOpError(
-                f"Unsupported Python introspection attribute {method_name!r} in {label}"
-            )
-        resolved = _find_custom_method(module_type, method_name, nn)
-        if resolved is not None:
-            owner, method = resolved
-            _validate_reachable_python_function(
-                function=method,
-                label=f"{owner.__name__}.{method_name}",
-                module_type=module_type,
-                nn=nn,
-                torch=torch,
-                seen=seen,
-            )
-
-
-def _find_custom_method(
-    module_type: type[object],
-    name: str,
-    nn: object,
-) -> tuple[type[object], object] | None:
-    framework_classes = _framework_module_classes(nn)
-    for cls in module_type.__mro__:
-        if cls in framework_classes:
-            break
-        if name in vars(cls):
-            value = vars(cls)[name]
-            if isinstance(value, FunctionType):
-                return cls, value
-            if type(value) in (staticmethod, classmethod):
-                return cls, value.__func__
-            return None
-    return None
+        validator(nn)
+    except trusted_base_exception:
+        raise integrity_marker from None
+    if callback_error is not None:
+        raise callback_error
+    return result
 
 
 def _raw_static_attribute(owner: object, name: str) -> object:
@@ -2129,6 +1010,13 @@ def _validate_framework_integrity_impl(nn: object) -> None:
         is not _TRUSTED_SYS_BYTEORDER
     ):
         raise UnsupportedOpError("Unsupported modified sys runtime bindings")
+    current_sys_modules = _raw_python_module_namespace(sys).get("modules")
+    if (
+        _TRUSTED_TYPE(current_sys_modules) is not _TRUSTED_DICT_TYPE
+        or current_sys_modules is not _TRUSTED_SYS_MODULES
+        or current_sys_modules.get("torch") is not _TRUSTED_TORCH_MODULE
+    ):
+        raise UnsupportedOpError("Unsupported modified sys.modules torch binding")
 
     inspect_state = _raw_python_module_namespace(inspect)
     if inspect_state.get("getattr_static") is not _TRUSTED_INSPECT_GETATTR_STATIC:
@@ -2301,59 +1189,259 @@ def _make_integrity_validator(
     trusted_str_type: type[str],
     trusted_error: type[UnsupportedOpError],
     trusted_global_bindings: tuple[tuple[str, object], ...],
+    protected_frontend_bindings: tuple[tuple[str, object], ...],
+    protected_function_states: tuple[tuple[str, tuple[object, ...]], ...],
+    protected_class_states: tuple[tuple[str, type[object], object], ...],
+    component_manifest: tuple[tuple[object, ...], ...],
+    bootstrap_classes: tuple[type[BaseException], ...],
+    quant_reference_module: ModuleType,
+    quant_reference_globals: dict[str, object],
+    protected_quant_bindings: tuple[tuple[str, object], ...],
+    protected_quant_function_states: tuple[
+        tuple[str, tuple[object, ...]], ...
+    ],
+    protected_quant_class_states: tuple[tuple[str, type[object], object], ...],
+    state_matcher: object,
+    state_matcher_code: CodeType,
+    trusted_function_type: type[FunctionType],
+    trusted_dict_type: type[dict[object, object]],
+    trusted_len: object,
+    trusted_value_error: type[ValueError],
+    empty_cell: object,
+    trusted_module_type: type[ModuleType],
+    trusted_module_getattribute: object,
+    trusted_type_getattribute: object,
 ) -> object:
     # This wrapper is the bootstrap trust boundary. Its references live in
     # closure cells, so replacing their module-global mirrors cannot affect
     # the code that detects the replacement.
+    protected_class_integrity_error = trusted_error(
+        "Unsupported modified frontend compiler class"
+    )
+    runtime_keys_error = trusted_error("Unsupported modified frontend runtime keys")
+    checked_global_bindings = tuple(
+        (
+            name,
+            value,
+            trusted_error(f"Unsupported modified frontend trust root {name}"),
+        )
+        for name, value in trusted_global_bindings
+    )
+    error_binding_error = trusted_error("Unsupported modified frontend error binding")
+    parser_implementation_error = trusted_error(
+        "Unsupported modified frontend parser implementation"
+    )
+    integrity_implementation_error = trusted_error(
+        "Unsupported modified frontend integrity implementation"
+    )
+    integrity_validator_error = trusted_error(
+        "Unsupported modified frontend integrity validator"
+    )
+    validator_root_error = trusted_error(
+        "Unsupported modified frontend validator trust root"
+    )
+    state_matcher_error = trusted_error("Unsupported modified frontend state matcher")
+    checked_frontend_bindings = tuple(
+        (
+            name,
+            value,
+            trusted_error(f"Unsupported modified frontend parser dependency {name}"),
+        )
+        for name, value in protected_frontend_bindings
+    )
+    checked_function_states = tuple(
+        (
+            name,
+            state,
+            trusted_error(f"Unsupported modified frontend parser function {name}"),
+        )
+        for name, state in protected_function_states
+    )
+    checked_components = tuple(
+        (
+            label,
+            module,
+            source_namespace,
+            consumer_namespace,
+            bindings,
+            function_states,
+            trusted_error(f"Unsupported modified frontend component {label}"),
+        )
+        for (
+            label,
+            module,
+            source_namespace,
+            consumer_namespace,
+            bindings,
+            function_states,
+        ) in component_manifest
+    )
+    semantic_module_error = trusted_error(
+        "Unsupported modified semantic reference module"
+    )
+    semantic_keys_error = trusted_error("Unsupported modified semantic reference keys")
+    checked_quant_bindings = tuple(
+        (
+            name,
+            value,
+            trusted_error(f"Unsupported modified semantic reference dependency {name}"),
+        )
+        for name, value in protected_quant_bindings
+    )
+    checked_quant_function_states = tuple(
+        (
+            name,
+            state,
+            trusted_error(f"Unsupported modified semantic reference function {name}"),
+        )
+        for name, state in protected_quant_function_states
+    )
+    bootstrap_class_states = tuple(
+        (
+            cls,
+            tuple(trusted_type_getattribute(cls, "__dict__").items()),
+        )
+        for cls in bootstrap_classes
+    )
+
     def validate(nn: object) -> None:
+        # Error construction is part of the trust boundary.  Seal the two
+        # compiler-owned exception classes before any rejection path can
+        # instantiate a potentially modified class.
+        for cls, expected_items in bootstrap_class_states:
+            namespace = trusted_type_getattribute(cls, "__dict__")
+            if trusted_len(namespace) != trusted_len(expected_items):
+                raise protected_class_integrity_error
+            for name, expected in expected_items:
+                if namespace.get(name, empty_cell) is not expected:
+                    raise protected_class_integrity_error
         for key in frontend_globals:
             if trusted_type(key) is not trusted_str_type:
-                raise trusted_error("Unsupported modified frontend runtime keys")
-        for name, value in trusted_global_bindings:
+                raise runtime_keys_error
+        for name, value, failure in checked_global_bindings:
             if frontend_globals.get(name) is not value:
-                raise trusted_error(
-                    f"Unsupported modified frontend trust root {name}"
-                )
+                raise failure
         if frontend_globals.get("UnsupportedOpError") is not trusted_error:
-            raise trusted_error("Unsupported modified frontend error binding")
+            raise error_binding_error
         if (
             frontend_globals.get("_parse_model_impl")
             is not parse_implementation
         ):
-            raise trusted_error("Unsupported modified frontend parser implementation")
+            raise parser_implementation_error
         if (
             frontend_globals.get("_validate_framework_integrity_impl")
             is not implementation
         ):
-            raise trusted_error(
-                "Unsupported modified frontend integrity implementation"
-            )
+            raise integrity_implementation_error
         if frontend_globals.get("_validate_framework_integrity") is not validate:
-            raise trusted_error("Unsupported modified frontend integrity validator")
+            raise integrity_validator_error
         if (
             frontend_globals.get("_TRUSTED_VALIDATE_FRAMEWORK_INTEGRITY")
             is not validate
         ):
-            raise trusted_error("Unsupported modified frontend validator trust root")
+            raise validator_root_error
+        if state_matcher.__code__ is not state_matcher_code:
+            raise state_matcher_error
+        for name, value, failure in checked_frontend_bindings:
+            if frontend_globals.get(name, empty_cell) is not value:
+                raise failure
+        for name, state, failure in checked_function_states:
+            function = frontend_globals.get(name, empty_cell)
+            if not state_matcher(
+                function,
+                state,
+                trusted_type,
+                trusted_function_type,
+                trusted_dict_type,
+                trusted_str_type,
+                trusted_len,
+                trusted_value_error,
+                empty_cell,
+            ):
+                raise failure
+        for (
+            _label,
+            module,
+            source_namespace,
+            consumer_namespace,
+            bindings,
+            function_states,
+            failure,
+        ) in checked_components:
+            if (
+                trusted_type(module) is not trusted_module_type
+                or trusted_module_getattribute(module, "__dict__")
+                is not source_namespace
+            ):
+                raise failure
+            for key in source_namespace:
+                if trusted_type(key) is not trusted_str_type:
+                    raise failure
+            for key in consumer_namespace:
+                if trusted_type(key) is not trusted_str_type:
+                    raise failure
+            for source_name, consumer_name, value in bindings:
+                if (
+                    source_namespace.get(source_name, empty_cell) is not value
+                    or consumer_namespace.get(consumer_name, empty_cell) is not value
+                ):
+                    raise failure
+            for source_name, consumer_name, state in function_states:
+                source_function = source_namespace.get(source_name, empty_cell)
+                consumer_function = consumer_namespace.get(
+                    consumer_name,
+                    empty_cell,
+                )
+                if source_function is not consumer_function or not state_matcher(
+                    source_function,
+                    state,
+                    trusted_type,
+                    trusted_function_type,
+                    trusted_dict_type,
+                    trusted_str_type,
+                    trusted_len,
+                    trusted_value_error,
+                    empty_cell,
+                ):
+                    raise failure
+        # Establish the Python/PyTorch/NumPy bootstrap before the richer class
+        # fingerprints below.  Those fingerprints intentionally inspect class
+        # namespaces and must never resolve a replaced builtin first.
         implementation(nn)
+        for name, cls, state in protected_class_states:
+            if _class_local_fingerprint(cls) != state:
+                raise protected_class_integrity_error
+        if (
+            trusted_type(quant_reference_module) is not trusted_module_type
+            or trusted_module_getattribute(quant_reference_module, "__dict__")
+            is not quant_reference_globals
+        ):
+            raise semantic_module_error
+        for key in quant_reference_globals:
+            if trusted_type(key) is not trusted_str_type:
+                raise semantic_keys_error
+        for name, value, failure in checked_quant_bindings:
+            if quant_reference_globals.get(name, empty_cell) is not value:
+                raise failure
+        for name, state, failure in checked_quant_function_states:
+            function = quant_reference_globals.get(name, empty_cell)
+            if not state_matcher(
+                function,
+                state,
+                trusted_type,
+                trusted_function_type,
+                trusted_dict_type,
+                trusted_str_type,
+                trusted_len,
+                trusted_value_error,
+                empty_cell,
+            ):
+                raise failure
+        for name, cls, state in protected_quant_class_states:
+            if _class_local_fingerprint(cls) != state:
+                raise protected_class_integrity_error
 
     return validate
-
-
-_validate_framework_integrity = _make_integrity_validator(
-    _validate_framework_integrity_impl,
-    _parse_model_impl,
-    _TRUSTED_FRONTEND_GLOBALS,
-    _TRUSTED_TYPE,
-    _TRUSTED_STR_TYPE,
-    _TRUSTED_UNSUPPORTED_OP_ERROR,
-    tuple(
-        (name, value)
-        for name, value in _TRUSTED_FRONTEND_GLOBALS.items()
-        if name.startswith("_TRUSTED_")
-    ),
-)
-_TRUSTED_VALIDATE_FRAMEWORK_INTEGRITY = _validate_framework_integrity
 
 
 def _make_parse_model(
@@ -2364,844 +1452,136 @@ def _make_parse_model(
     frontend_globals: dict[str, object],
     trusted_type: type[object],
     trusted_str_type: type[str],
-    trusted_error: type[UnsupportedOpError],
+    validator_state: tuple[object, ...],
+    state_matcher: object,
+    state_matcher_code: CodeType,
+    trusted_function_type: type[FunctionType],
+    trusted_dict_type: type[dict[object, object]],
+    trusted_len: object,
+    trusted_value_error: type[ValueError],
+    empty_cell: object,
+    security_context: tuple[object, ...],
+    checked_call: object,
+    trusted_integrity_marker: type[_PostCallbackIntegrityError],
+    integrity_errors: tuple[UnsupportedOpError, ...],
 ) -> object:
     def parse_model(
         model: object,
         input_shape: Sequence[int],
         input_dtype: object | None = None,
     ) -> GraphIR:
+        trusted_capsule = "__torch2rtl_parse_model_trusted_capsule_v1__"
+        trusted_getitem = "__torch2rtl_parse_model_trusted_getitem_v1__"
+        implementation = trusted_getitem(trusted_capsule, 0)
+        validator = trusted_getitem(trusted_capsule, 1)
+        torch = trusted_getitem(trusted_capsule, 2)
+        nn = trusted_getitem(trusted_capsule, 3)
+        frontend_globals = trusted_getitem(trusted_capsule, 4)
+        trusted_type = trusted_getitem(trusted_capsule, 5)
+        trusted_str_type = trusted_getitem(trusted_capsule, 6)
+        validator_state = trusted_getitem(trusted_capsule, 7)
+        state_matcher = trusted_getitem(trusted_capsule, 8)
+        state_matcher_code = trusted_getitem(trusted_capsule, 9)
+        trusted_function_type = trusted_getitem(trusted_capsule, 10)
+        trusted_dict_type = trusted_getitem(trusted_capsule, 11)
+        trusted_len = trusted_getitem(trusted_capsule, 12)
+        trusted_value_error = trusted_getitem(trusted_capsule, 13)
+        empty_cell = trusted_getitem(trusted_capsule, 14)
+        security_context = trusted_getitem(trusted_capsule, 15)
+        checked_call = trusted_getitem(trusted_capsule, 16)
+        trusted_integrity_marker = trusted_getitem(trusted_capsule, 17)
+        safe_errors = trusted_getitem(trusted_capsule, 18)
+        public_function = trusted_getitem(trusted_capsule, 19)
         for key in frontend_globals:
             if trusted_type(key) is not trusted_str_type:
-                raise trusted_error("Unsupported modified frontend runtime keys")
-        if frontend_globals.get("parse_model") is not parse_model:
-            raise trusted_error("Unsupported modified frontend parser binding")
+                raise safe_errors[2]
+        if frontend_globals.get("parse_model") is not public_function:
+            raise safe_errors[3]
+        if frontend_globals.get("_parse_model_impl") is not implementation:
+            raise safe_errors[4]
+        if frontend_globals.get("_validate_framework_integrity") is not validator:
+            raise safe_errors[5]
+        if state_matcher.__code__ is not state_matcher_code or not state_matcher(
+            validator,
+            validator_state,
+            trusted_type,
+            trusted_function_type,
+            trusted_dict_type,
+            trusted_str_type,
+            trusted_len,
+            trusted_value_error,
+            empty_cell,
+        ):
+            raise safe_errors[5]
         validator(nn)
-        return implementation(model, input_shape, input_dtype, torch, nn)
-
-    return parse_model
-
-
-parse_model = _make_parse_model(
-    _parse_model_impl,
-    _validate_framework_integrity,
-    _TRUSTED_TORCH_MODULE,
-    _TRUSTED_TORCH_NN_MODULE,
-    _TRUSTED_FRONTEND_GLOBALS,
-    _TRUSTED_TYPE,
-    _TRUSTED_STR_TYPE,
-    _TRUSTED_UNSUPPORTED_OP_ERROR,
-)
-parse_model.__qualname__ = "parse_model"
-
-
-def _next_loaded_attribute(
-    instructions: tuple[dis.Instruction, ...],
-    index: int,
-) -> str | None:
-    for following in instructions[index + 1 :]:
-        if following.opname in {"CACHE", "EXTENDED_ARG", "NOP"}:
-            continue
-        if following.opname in {"LOAD_ATTR", "LOAD_METHOD"}:
-            return str(following.argval)
-        return None
-    return None
-
-
-def _is_immutable_python_state(value: object, seen: set[int]) -> bool:
-    if value is None or type(value) in (bool, int, float, complex, str, bytes):
-        return True
-    identity = id(value)
-    if identity in seen:
-        return True
-    seen.add(identity)
-    try:
-        if type(value) is tuple:
-            return all(_is_immutable_python_state(item, seen) for item in value)
-        if type(value) is frozenset:
-            return all(_is_immutable_python_state(item, seen) for item in value)
-        return False
-    finally:
-        seen.remove(identity)
-
-
-def _contains_code_object(value: object) -> bool:
-    if isinstance(value, CodeType):
-        return True
-    if type(value) in (tuple, frozenset):
-        return any(_contains_code_object(item) for item in value)
-    return False
-
-
-def _validate_copy_safe_instance_state(
-    module: object,
-    display_name: str,
-    torch: object,
-) -> None:
-    for name, value in _raw_module_state(module).items():
-        if name in {"_modules", "_parameters", "_buffers"}:
-            continue
-        if not _is_copy_safe_state_value(value, torch, set()):
-            raise UnsupportedOpError(
-                f"Unsupported external Python state {name!r} on module "
-                f"{display_name}: value cannot be copied safely"
-            )
-
-
-def _is_copy_safe_state_value(value: object, torch: object, seen: set[int]) -> bool:
-    if value is None or type(value) in (bool, int, float, complex, str, bytes):
-        return True
-    if type(value) in (torch.Tensor, torch.nn.Parameter, np.ndarray):
-        return False
-    if type(value) in (torch.dtype, torch.device):
-        return True
-    identity = id(value)
-    if identity in seen:
-        return True
-    seen.add(identity)
-    try:
-        if type(value) in (dict, OrderedDict):
-            return all(
-                _is_copy_safe_state_value(key, torch, seen)
-                and _is_copy_safe_state_value(item, torch, seen)
-                for key, item in value.items()
-            )
-        if type(value) in (list, tuple, set, frozenset):
-            return all(_is_copy_safe_state_value(item, torch, seen) for item in value)
-        return False
-    finally:
-        seen.remove(identity)
-
-
-def _snapshot_module_class_definitions(
-    model: object,
-    nn: object,
-) -> tuple[tuple[type[object], dict[str, object]], ...]:
-    snapshots: list[tuple[type[object], dict[str, object]]] = []
-    seen: set[type[object]] = set()
-    framework_classes = _framework_module_classes(nn)
-    for _, module in _trusted_named_modules(model, nn):
-        for cls in type(module).__mro__:
-            if cls in framework_classes:
-                break
-            if cls not in seen:
-                snapshots.append((cls, dict(vars(cls))))
-                seen.add(cls)
-    return tuple(snapshots)
-
-
-def _restore_module_class_definitions(
-    snapshots: tuple[tuple[type[object], dict[str, object]], ...],
-) -> bool:
-    changed = False
-    for cls, before in snapshots:
-        current = dict(vars(cls))
-        if current.keys() != before.keys() or any(
-            current.get(name) is not value for name, value in before.items()
+        if (
+            frontend_globals.get("_TRUSTED_CALLBACK_SECURITY_CONTEXT")
+            is not security_context
         ):
-            changed = True
-        for name in current.keys() - before.keys():
-            delattr(cls, name)
-        for name, value in before.items():
-            if current.get(name) is not value:
-                setattr(cls, name, value)
-    return changed
-
-
-def _raw_module_state(module: object) -> dict[str, object]:
-    state = object.__getattribute__(module, "__dict__")
-    if type(state) is not dict:
-        raise UnsupportedOpError("Unsupported nn.Module state mapping")
-    if any(type(name) is not str for name in state):
-        raise UnsupportedOpError("Unsupported non-string nn.Module state key")
-    return state
-
-
-def _trusted_named_modules(model: object, nn: object) -> tuple[tuple[str, object], ...]:
-    modules: list[tuple[str, object]] = []
-    seen: set[int] = set()
-
-    def visit(name: str, module: object) -> None:
-        if not isinstance(module, nn.Module):
-            raise UnsupportedOpError(
-                f"Unsupported module tree entry {name or '<root>'}: expected nn.Module"
-            )
-        identity = id(module)
-        if identity in seen:
-            return
-        seen.add(identity)
-        modules.append((name, module))
-        children = _raw_module_state(module).get("_modules")
-        if type(children) is not dict:
-            raise UnsupportedOpError(
-                f"Unsupported module tree on {name or '<root>'}: _modules must be a dict"
-            )
-        for child_name, child in children.items():
-            if type(child_name) is not str:
-                raise UnsupportedOpError("Unsupported non-string module name")
-            if child is None:
-                continue
-            qualified = f"{name}.{child_name}" if name else child_name
-            visit(qualified, child)
-
-    visit("", model)
-    return tuple(modules)
-
-
-def _trusted_named_tensors(
-    modules: tuple[tuple[str, object], ...],
-    torch: object,
-) -> tuple[tuple[str, object, bool], ...]:
-    tensors: list[tuple[str, object, bool]] = []
-    for module_name, module in modules:
-        state = _raw_module_state(module)
-        for registry_name in ("_parameters", "_buffers"):
-            registry = state.get(registry_name)
-            if type(registry) is not dict:
-                raise UnsupportedOpError(
-                    f"Unsupported module tensor registry {registry_name} on "
-                    f"{module_name or '<root>'}"
-                )
-            for tensor_name, tensor in registry.items():
-                if type(tensor_name) is not str:
-                    raise UnsupportedOpError(
-                        f"Unsupported non-string tensor name in {registry_name}"
-                    )
-                if tensor is None:
-                    continue
-                if not isinstance(tensor, torch.Tensor):
-                    raise UnsupportedOpError(
-                        f"Unsupported non-tensor value in {registry_name} on "
-                        f"{module_name or '<root>'}"
-                    )
-                expected_type = (
-                    torch.nn.Parameter
-                    if registry_name == "_parameters"
-                    else torch.Tensor
-                )
-                if type(tensor) is not expected_type:
-                    raise UnsupportedOpError(
-                        f"Unsupported tensor subclass {type(tensor).__name__} in "
-                        f"{registry_name} on {module_name or '<root>'}"
-                    )
-                if tensor.device.type != "cpu":
-                    raise UnsupportedOpError(
-                        f"Unsupported tensor device {tensor.device} for "
-                        f"{module_name or '<root>'}.{tensor_name}; only CPU is supported"
-                    )
-                if tensor.layout is not torch.strided:
-                    raise UnsupportedOpError(
-                        f"Unsupported tensor layout {tensor.layout} for "
-                        f"{module_name or '<root>'}.{tensor_name}; only strided is supported"
-                    )
-                if not tensor.is_contiguous():
-                    raise UnsupportedOpError(
-                        f"Unsupported non-contiguous tensor "
-                        f"{module_name or '<root>'}.{tensor_name}"
-                    )
-                if tensor.is_conj():
-                    raise UnsupportedOpError(
-                        f"Unsupported conjugate view bit on tensor "
-                        f"{module_name or '<root>'}.{tensor_name}"
-                    )
-                if tensor.is_neg():
-                    raise UnsupportedOpError(
-                        f"Unsupported negative view bit on tensor "
-                        f"{module_name or '<root>'}.{tensor_name}"
-                    )
-                if tensor.grad is not None:
-                    raise UnsupportedOpError(
-                        f"Unsupported gradient state on tensor "
-                        f"{module_name or '<root>'}.{tensor_name}; "
-                        "autograd state is not lowered"
-                    )
-                qualified = f"{module_name}.{tensor_name}" if module_name else tensor_name
-                is_batchnorm_counter = (
-                    type(module) is torch.nn.BatchNorm2d
-                    and registry_name == "_buffers"
-                    and tensor_name == "num_batches_tracked"
-                )
-                if is_batchnorm_counter and (
-                    tensor.dtype is not torch.int64 or tuple(tensor.shape) != ()
-                ):
-                    raise UnsupportedOpError(
-                        "Unsupported BatchNorm2d num_batches_tracked: expected "
-                        "a scalar int64 Tensor"
-                    )
-                tensors.append((qualified, tensor, is_batchnorm_counter))
-    return tuple(tensors)
-
-
-def _snapshot_module_state(
-    model: object,
-    nn: object,
-    torch: object,
-) -> tuple[object, ...]:
-    snapshots: list[object] = []
-    for module_name, module in _trusted_named_modules(model, nn):
-        state = _raw_module_state(module)
-        attributes = tuple(
-            sorted(
-                (
-                    name,
-                    _freeze_state_value(value, torch, set()),
-                )
-                for name, value in state.items()
-                if name != "_modules"
-            )
-        )
-        child_registry = state["_modules"]
-        children = tuple(
-            (name, type(child))
-            for name, child in child_registry.items()
-            if child is not None
-        )
-        snapshots.append(
-            (
-                module_name,
-                type(module),
-                attributes,
-                children,
-            )
-        )
-    return tuple(snapshots)
-
-
-def _freeze_state_value(value: object, torch: object, seen: set[int]) -> object:
-    if value is None or type(value) in (bool, int, float, complex, str, bytes):
-        return (type(value).__qualname__, repr(value))
-    if type(value) in (torch.Tensor, torch.nn.Parameter):
-        data = (
-            value.detach()
-            .resolve_conj()
-            .resolve_neg()
-            .cpu()
-            .contiguous()
-            .numpy()
-        )
-        gradient = None
-        if value.grad is not None:
-            gradient = _freeze_state_value(value.grad, torch, seen)
-        return (
-            "tensor",
-            type(value).__module__,
-            type(value).__qualname__,
-            str(value.dtype),
-            str(value.device),
-            str(value.layout),
-            tuple(value.shape),
-            tuple(value.stride()),
-            value.storage_offset(),
-            value.requires_grad,
-            value.is_conj(),
-            value.is_neg(),
-            gradient,
-            data.tobytes(),
-        )
-    if type(value) is np.ndarray:
-        data = np.ascontiguousarray(value)
-        return (
-            "ndarray",
-            str(value.dtype),
-            tuple(value.shape),
-            tuple(value.strides),
-            value.flags.c_contiguous,
-            value.flags.f_contiguous,
-            value.flags.owndata,
-            value.flags.writeable,
-            value.flags.aligned,
-            data.tobytes(),
-        )
-
-    identity = id(value)
-    if identity in seen:
-        return ("cycle", identity)
-    seen.add(identity)
-    try:
-        if isinstance(value, dict):
-            items = [
-                (
-                    _freeze_state_value(key, torch, seen),
-                    _freeze_state_value(item, torch, seen),
-                )
-                for key, item in value.items()
-            ]
-            return ("dict", tuple(sorted(items, key=repr)))
-        if isinstance(value, (list, tuple)):
-            return (
-                type(value).__qualname__,
-                tuple(_freeze_state_value(item, torch, seen) for item in value),
-            )
-        if isinstance(value, (set, frozenset)):
-            items = [_freeze_state_value(item, torch, seen) for item in value]
-            return (type(value).__qualname__, tuple(sorted(items, key=repr)))
-        if callable(value):
-            return (
-                "callable",
-                getattr(value, "__module__", ""),
-                getattr(value, "__qualname__", repr(value)),
-            )
-        state = getattr(value, "__dict__", None)
-        if isinstance(state, dict):
-            return (
-                "object",
-                type(value).__module__,
-                type(value).__qualname__,
-                _freeze_state_value(state, torch, seen),
-            )
-        return ("value", type(value).__module__, type(value).__qualname__, repr(value))
-    finally:
-        seen.remove(identity)
-
-
-def _validate_fusion_boundary(
-    source_model: object,
-    fused_model: object,
-    input_shape: tuple[int, ...],
-    float_dtype: str,
-    nn: object,
-    torch: object,
-) -> None:
-    dtype = torch.float32 if float_dtype == "float32" else torch.float64
-    numpy_dtype = np.dtype(float_dtype)
-    element_count = math.prod(input_shape)
-    probe_values = (
-        np.zeros(input_shape, dtype=numpy_dtype),
-        np.linspace(-0.75, 0.75, num=element_count, dtype=numpy_dtype).reshape(
-            input_shape
-        ),
-    )
-    rtol, atol = (
-        (1e-5, 1e-6) if float_dtype == "float32" else (1e-12, 1e-12)
-    )
-    for values in probe_values:
-        probe_input = torch.from_numpy(values.copy()).to(dtype=dtype)
-        source_output = _run_concrete_probe(
-            source_model,
-            probe_input.unsqueeze(0),
-            "source singleton-batch",
-            nn,
-            torch,
-        )
-        fused_output = _run_concrete_probe(
-            fused_model,
-            probe_input,
-            "fused batchless",
-            nn,
-            torch,
-            copy_model=False,
-        )
-        if not isinstance(source_output, torch.Tensor) or not isinstance(
-            fused_output,
-            torch.Tensor,
-        ):
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: source and fused models must "
-                "return one Tensor"
-            )
-        if source_output.dtype != fused_output.dtype:
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: source and fused output dtypes "
-                f"differ ({source_output.dtype} != {fused_output.dtype})"
-            )
-
-        source_values = source_output.detach().cpu().numpy()
-        fused_values = fused_output.detach().cpu().numpy()
-        if source_values.shape == () or fused_values.shape == ():
-            if (
-                source_values.shape != ()
-                or fused_values.shape != ()
-                or source_output.dtype is not torch.int64
-                or source_values.item() != fused_values.item()
-            ):
-                raise UnsupportedOpError(
-                    "Unsupported fusion semantics: scalar Argmax/class_id "
-                    "changed across Conv2d/BatchNorm2d fusion"
-                )
-            continue
-
-        if source_output.dtype is not dtype or fused_output.dtype is not dtype:
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: tensor outputs must preserve "
-                f"the model dtype {dtype}"
-            )
-        if source_values.shape[0] != 1:
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: source tensor output must have "
-                "a leading singleton batch dimension"
-            )
-        source_batchless = source_values[0]
-        if source_batchless.shape != fused_values.shape:
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: source singleton-batch output "
-                f"shape {source_batchless.shape} does not match fused batchless "
-                f"shape {fused_values.shape}"
-            )
-        if not np.all(np.isfinite(source_batchless)) or not np.all(
-            np.isfinite(fused_values)
-        ):
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: source and fused outputs must "
-                "contain only finite values"
-            )
-        if not np.allclose(
-            source_batchless,
-            fused_values,
-            rtol=rtol,
-            atol=atol,
-        ):
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: source singleton-batch output "
-                "does not match fused batchless output"
-            )
-        if int(np.argmax(source_batchless.reshape(-1))) != int(
-            np.argmax(fused_values.reshape(-1))
-        ):
-            raise UnsupportedOpError(
-                "Unsupported fusion semantics: Argmax/class_id changed across "
-                "Conv2d/BatchNorm2d fusion"
-            )
-
-
-def _run_concrete_probe(
-    model: object,
-    probe_input: object,
-    label: str,
-    nn: object,
-    torch: object,
-    *,
-    copy_model: bool = True,
-) -> object:
-    probe_model = _copy_model_for_tracing(model, nn, torch) if copy_model else model
-    before_state = _snapshot_module_state(probe_model, nn, torch)
-    class_state = _snapshot_module_class_definitions(probe_model, nn)
-    probe_error: Exception | None = None
-    output: object | None = None
-    try:
-        with torch.no_grad():
-            output = probe_model(probe_input)
-    except Exception as exc:
-        probe_error = exc
-    class_changed = _restore_module_class_definitions(class_state)
-    instance_changed = before_state != _snapshot_module_state(
-        probe_model,
-        nn,
-        torch,
-    )
-    if class_changed or instance_changed:
-        raise UnsupportedOpError(
-            f"Unsupported Python state mutation during {label} semantic probe"
-        )
-    if probe_error is not None:
-        raise UnsupportedOpError(
-            f"Unsupported {label} model semantics: {probe_error}"
-        ) from probe_error
-    return output
-
-
-def _validate_lowered_semantics(
-    model: object,
-    graph: GraphIR,
-    input_shape: tuple[int, ...],
-    float_dtype: str,
-    nn: object,
-    torch: object,
-    *,
-    copy_model: bool = True,
-) -> None:
-    from torch2rtl.quant.reference import infer_float_graph
-
-    dtype = torch.float32 if float_dtype == "float32" else torch.float64
-    numpy_dtype = np.dtype(float_dtype)
-    element_count = math.prod(input_shape)
-    probe_values = (
-        np.zeros(input_shape, dtype=numpy_dtype),
-        np.linspace(-0.75, 0.75, num=element_count, dtype=numpy_dtype).reshape(
-            input_shape
-        ),
-    )
-    for values in probe_values:
-        probe_model = (
-            _copy_model_for_tracing(model, nn, torch) if copy_model else model
-        )
-        before_state = _snapshot_module_state(probe_model, nn, torch)
-        class_state = _snapshot_module_class_definitions(probe_model, nn)
-        probe_error: Exception | None = None
-        actual: object | None = None
-        probe_input = torch.from_numpy(values.copy()).to(dtype=dtype)
+            raise safe_errors[6]
         try:
-            with torch.no_grad():
-                actual = probe_model(probe_input)
-        except Exception as exc:
-            probe_error = exc
-        class_changed = _restore_module_class_definitions(class_state)
-        instance_changed = before_state != _snapshot_module_state(
-            probe_model,
-            nn,
+            return implementation(
+                model,
+                input_shape,
+                input_dtype,
+                torch,
+                nn,
+                _security_context=security_context,
+                _checked_call=checked_call,
+            )
+        except trusted_integrity_marker:
+            raise safe_errors[7] from None
+
+    # The outer wrapper is the explicit trust anchor in the documented threat
+    # model.  Embedding its dependency capsule in the immutable code constants
+    # avoids writable closure/default/global roots while preserving a normal
+    # Python function for signature, pickle, and public identity contracts.
+    class TrustedCapsule(tuple):
+        __slots__ = ()
+
+    capsule = TrustedCapsule(
+        (
+            implementation,
+            validator,
             torch,
+            nn,
+            frontend_globals,
+            trusted_type,
+            trusted_str_type,
+            validator_state,
+            state_matcher,
+            state_matcher_code,
+            trusted_function_type,
+            trusted_dict_type,
+            trusted_len,
+            trusted_value_error,
+            empty_cell,
+            security_context,
+            checked_call,
+            trusted_integrity_marker,
+            integrity_errors,
+            parse_model,
         )
-        if class_changed or instance_changed:
-            raise UnsupportedOpError(
-                "Unsupported Python state mutation during concrete semantic probe"
-            )
-        if probe_error is not None:
-            raise UnsupportedOpError(
-                f"Unsupported concrete model semantics: {probe_error}"
-            ) from probe_error
-        if not isinstance(actual, torch.Tensor):
-            raise UnsupportedOpError(
-                "Unsupported model output: concrete forward must return one Tensor"
-            )
-
-        expected_dtype = torch.int64 if graph.output.dtype == "int64" else dtype
-        if actual.dtype != expected_dtype:
-            raise UnsupportedOpError(
-                "Unsupported model output dtype: concrete forward produced "
-                f"{actual.dtype}, GraphIR requires {expected_dtype}"
-            )
-        actual_values = actual.detach().cpu().numpy()
-        expected_values = infer_float_graph(graph, values).output
-        if actual_values.shape != expected_values.shape or not np.array_equal(
-            actual_values,
-            expected_values,
-            equal_nan=True,
-        ):
-            raise UnsupportedOpError(
-                "Unsupported model semantics: concrete forward does not match lowered GraphIR"
-            )
-
-
-def _normalize_float_dtype(
-    value: object | None,
-    torch: object,
-    supported: dict[object, str],
-) -> object | None:
-    if value is None:
-        return None
-    if value is torch.float32 or value is np.dtype(np.float32):
-        return torch.float32
-    if value is torch.float64 or value is np.dtype(np.float64):
-        return torch.float64
-    if type(value) is str:
-        if value in {"float32", "torch.float32"}:
-            return torch.float32
-        if value in {"float64", "torch.float64"}:
-            return torch.float64
-    raise UnsupportedOpError(
-        "Unsupported input dtype; only float32 and float64 are supported"
     )
-
-
-def _validate_input_shape(input_shape: Sequence[int]) -> tuple[int, ...]:
-    if type(input_shape) in (str, bytes, bytearray) or not isinstance(
-        input_shape,
-        SequenceABC,
+    sentinel = "__torch2rtl_parse_model_trusted_capsule_v1__"
+    getitem_sentinel = "__torch2rtl_parse_model_trusted_getitem_v1__"
+    constants = parse_model.__code__.co_consts
+    if (
+        sum(value == sentinel for value in constants) != 1
+        or sum(value == getitem_sentinel for value in constants) != 1
     ):
-        raise UnsupportedOpError(
-            "Unsupported input shape: expected a finite sequence of positive integers"
+        raise RuntimeError("Could not construct frontend parser trust capsule")
+    parse_model.__code__ = parse_model.__code__.replace(
+        co_consts=tuple(
+            capsule
+            if value == sentinel
+            else tuple.__getitem__
+            if value == getitem_sentinel
+            else value
+            for value in constants
         )
-    try:
-        shape = tuple(input_shape)
-    except Exception as exc:
-        raise UnsupportedOpError(
-            "Unsupported input shape: expected a finite sequence of positive integers"
-        ) from exc
-    if len(shape) > _MAX_TENSOR_RANK:
-        raise UnsupportedOpError(
-            f"Unsupported input shape: rank must not exceed {_MAX_TENSOR_RANK}"
-        )
-    for index, dim in enumerate(shape):
-        if type(dim) is not int or dim <= 0:
-            raise UnsupportedOpError(
-                "Unsupported input shape: positive integers are required; "
-                f"dimension at index {index} is not a positive built-in int"
-            )
-    _validate_tensor_element_count(shape, "input shape")
-    return shape
-
-
-def _validate_tensor_element_count(shape: Sequence[int], label: str) -> None:
-    element_count = 1
-    for dimension in shape:
-        if dimension > _MAX_TENSOR_ELEMENTS // element_count:
-            raise UnsupportedOpError(
-                f"Unsupported {label}: total element count exceeds "
-                f"the v0.2 limit of {_MAX_TENSOR_ELEMENTS}"
-            )
-        element_count *= dimension
-
-
-def _parse_output_node(node: object) -> object:
-    args = tuple(getattr(node, "args", ()))
-    kwargs = dict(getattr(node, "kwargs", {}))
-    if len(args) != 1 or kwargs:
-        raise UnsupportedOpError(
-            "Unsupported FX output: expected one tensor value without keyword arguments"
-        )
-    output_value = args[0]
-    if not _is_fx_node(output_value):
-        raise UnsupportedOpError(
-            "Unsupported FX output: tuples, lists, dictionaries, and constants "
-            "are not supported"
-        )
-    return output_value
-
-
-def _require_sequential_input(
-    node: object,
-    expected_node: object,
-    allow_parameters: bool = False,
-) -> None:
-    args = tuple(getattr(node, "args", ()))
-    kwargs = dict(getattr(node, "kwargs", {}))
-    if not args or not _is_fx_node(args[0]):
-        raise UnsupportedOpError(
-            f"Unsupported FX arguments for node {getattr(node, 'name', '<unknown>')}: "
-            "the first argument must be the previous tensor"
-        )
-    if args[0] is not expected_node:
-        raise UnsupportedOpError(
-            f"Unsupported FX graph at node {getattr(node, 'name', '<unknown>')}: "
-            "only a single sequential dependency chain is supported"
-        )
-    if not allow_parameters and (len(args) != 1 or kwargs):
-        raise UnsupportedOpError(
-            f"Unsupported FX arguments for node {getattr(node, 'name', '<unknown>')}: "
-            "module calls must receive only the previous tensor"
-        )
-
-
-def _validate_argmax_arguments(node: object, is_method: bool) -> None:
-    args = tuple(getattr(node, "args", ()))
-    kwargs = dict(getattr(node, "kwargs", {}))
-    positional = args[1:]
-    if len(positional) > 2:
-        raise UnsupportedOpError("Unsupported argmax arguments")
-
-    allowed_kwargs = {"dim", "keepdim"}
-    if not is_method:
-        allowed_kwargs.add("out")
-    unexpected = set(kwargs) - allowed_kwargs
-    if unexpected:
-        names = ", ".join(sorted(str(name) for name in unexpected))
-        raise UnsupportedOpError(f"Unsupported argmax keyword arguments: {names}")
-
-    dim = _positional_or_keyword(positional, 0, kwargs, "dim", None)
-    keepdim = _positional_or_keyword(positional, 1, kwargs, "keepdim", False)
-    if not is_method and kwargs.get("out") is not None:
-        raise UnsupportedOpError("Unsupported argmax out argument")
-    if dim is not None or keepdim is not False:
-        raise UnsupportedOpError(
-            "Unsupported argmax: only global argmax with dim=None and "
-            "keepdim=False is supported"
-        )
-
-
-def _positional_or_keyword(
-    positional: tuple[object, ...],
-    index: int,
-    kwargs: dict[object, object],
-    name: str,
-    default: object,
-) -> object:
-    if index < len(positional):
-        if name in kwargs:
-            raise UnsupportedOpError(f"argmax received {name} more than once")
-        return positional[index]
-    return kwargs.get(name, default)
-
-
-def _is_fx_node(value: object) -> bool:
-    return (
-        hasattr(value, "op")
-        and hasattr(value, "target")
-        and hasattr(value, "args")
-        and hasattr(value, "kwargs")
     )
-
-
-def _conv_output_dim(input_size: int, kernel_size: int, stride: int, padding: int) -> int:
-    return ((input_size + 2 * padding - kernel_size) // stride) + 1
-
-
-def _int_pair(value: object, name: str) -> tuple[int, int]:
-    if isinstance(value, str):
-        raise UnsupportedOpError(f"Unsupported Conv2d {name}: string values are not supported")
-    if type(value) is int:
-        return (value, value)
-    if type(value) is tuple and len(value) == 2:
-        first, second = value
-        if type(first) is int and type(second) is int:
-            return (first, second)
-    raise UnsupportedOpError(f"Unsupported Conv2d {name}: expected int or int pair")
-
-
-def _positive_module_integer(value: object, module: str, attribute: str) -> int:
-    normalized = _module_integer(value, module, attribute)
-    if normalized <= 0:
-        raise UnsupportedOpError(
-            f"Unsupported {module} {attribute}: expected a positive built-in integer, "
-            f"got {value!r}"
-        )
-    return normalized
-
-
-def _module_integer(value: object, module: str, attribute: str) -> int:
-    if type(value) is not int:
-        raise UnsupportedOpError(
-            f"Unsupported {module} {attribute}: expected a built-in integer, "
-            f"got {value!r}"
-        )
-    return value
-
-
-def _required_parameter(
-    value: object,
-    module: str,
-    attribute: str,
-    nn: object,
-) -> object:
-    if type(value) is not nn.Parameter:
-        raise UnsupportedOpError(
-            f"Unsupported {module} {attribute}: expected a Parameter"
-        )
-    return value
-
-
-def _required_module_attribute(
-    module_value: object,
-    module: str,
-    attribute: str,
-) -> object:
-    try:
-        return getattr(module_value, attribute)
-    except AttributeError as exc:
-        raise UnsupportedOpError(
-            f"Unsupported {module}: required attribute {attribute!r} is missing"
-        ) from exc
-
-
-def _optional_parameter(
-    value: object,
-    module: str,
-    attribute: str,
-    nn: object,
-) -> object | None:
-    if value is None:
-        return None
-    return _required_parameter(value, module, attribute, nn)
-
-
-def _validate_conv_pair(
-    name: str,
-    values: tuple[int, int],
-    minimum: int,
-) -> None:
-    if any(value < minimum for value in values):
-        relation = "positive" if minimum == 1 else "non-negative"
-        raise UnsupportedOpError(
-            f"Unsupported Conv2d {name}: values must be {relation}, got {values}"
-        )
+    return parse_model
 
 
 def _load_python_module(path: Path) -> ModuleType:
@@ -3220,8 +1600,702 @@ def _load_python_module(path: Path) -> ModuleType:
     return module
 
 
-def _safe_name(name: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() else "_" for ch in name)
-    if cleaned and cleaned[0].isdigit():
-        cleaned = f"op_{cleaned}"
-    return cleaned or "op"
+# This is an authored manifest, not a discovered registry.  A new compiler
+# helper must be added deliberately so the integrity tests fail closed when
+# the parser call graph grows.
+_PROTECTED_FRONTEND_FUNCTION_NAMES = (
+    "_capture_function_integrity_state",
+    "_function_integrity_state_matches",
+    "_require_exact_string_dict",
+    "_definition_fingerprint",
+    "_shallow_state_fingerprint",
+    "_function_local_fingerprint",
+    "_descriptor_local_fingerprint",
+    "_class_local_fingerprint",
+    "_function_referenced_globals_fingerprint",
+    "_checked_untrusted_call",
+    "_raw_static_attribute",
+    "_raw_python_module_namespace",
+    "_framework_module_classes",
+    "_validate_framework_integrity_impl",
+    "_make_integrity_validator",
+    "_make_parse_model",
+)
+_PROTECTED_FRONTEND_FUNCTION_STATES = tuple(
+    (name, _capture_function_integrity_state(_TRUSTED_FRONTEND_GLOBALS[name]))
+    for name in _PROTECTED_FRONTEND_FUNCTION_NAMES
+)
+_PROTECTED_FRONTEND_BINDINGS = (
+    ("CodeType", CodeType),
+    ("FunctionType", FunctionType),
+    ("ModuleType", ModuleType),
+    ("GraphIR", GraphIR),
+    ("TensorIR", TensorIR),
+    ("ArgmaxIR", ArgmaxIR),
+    ("Conv2dIR", Conv2dIR),
+    ("FlattenIR", FlattenIR),
+    ("LinearIR", LinearIR),
+    ("ReluIR", ReluIR),
+    ("UnsupportedOpError", UnsupportedOpError),
+    ("_errors_component", _errors_component),
+    ("_fusion_component", _fusion_component),
+    ("_lowering_component", _lowering_component),
+    ("_model_contract_component", _model_contract_component),
+    ("_pipeline_component", _pipeline_component),
+    ("_semantics_component", _semantics_component),
+    ("_state_guard_component", _state_guard_component),
+    ("_quant_reference", _quant_reference),
+)
+
+_LOWERING_FUNCTION_BINDINGS = (
+    ("_require_exact_string_dict", "_require_exact_string_dict"),
+    ("_raw_static_attribute", "_raw_static_attribute"),
+    ("lower_fx_graph", "lower_fx_graph"),
+    ("_parse_module_node", "_parse_module_node"),
+    ("_lower_linear_module", "_lower_linear_module"),
+    ("_lower_conv2d_module", "_lower_conv2d_module"),
+    ("_lower_relu_module", "_lower_relu_module"),
+    ("_lower_flatten_module", "_lower_flatten_module"),
+    ("_flatten_shape", "_flatten_shape"),
+    ("_validate_input_shape", "_validate_input_shape"),
+    ("_validate_tensor_element_count", "_validate_tensor_element_count"),
+    ("_parse_output_node", "_parse_output_node"),
+    ("_require_sequential_input", "_require_sequential_input"),
+    ("_validate_argmax_arguments", "_validate_argmax_arguments"),
+    ("_lower_argmax_node", "_lower_argmax_node"),
+    ("_positional_or_keyword", "_positional_or_keyword"),
+    ("_is_fx_node", "_is_fx_node"),
+    ("_conv_output_dim", "_conv_output_dim"),
+    ("_int_pair", "_int_pair"),
+    ("_positive_module_integer", "_positive_module_integer"),
+    ("_module_integer", "_module_integer"),
+    ("_required_parameter", "_required_parameter"),
+    ("_required_module_attribute", "_required_module_attribute"),
+    ("_optional_parameter", "_optional_parameter"),
+    ("_validate_conv_pair", "_validate_conv_pair"),
+    ("_safe_name", "_safe_name"),
+)
+_PROTECTED_LOWERING_FUNCTION_STATES = tuple(
+    (
+        source_name,
+        consumer_name,
+        _capture_function_integrity_state(
+            _TRUSTED_LOWERING_GLOBALS[source_name]
+        ),
+    )
+    for source_name, consumer_name in _LOWERING_FUNCTION_BINDINGS
+)
+_PROTECTED_LOWERING_BINDINGS = (
+    (
+        "_MAX_TENSOR_ELEMENTS",
+        "_MAX_TENSOR_ELEMENTS",
+        _lowering_component._MAX_TENSOR_ELEMENTS,
+    ),
+    ("_MAX_TENSOR_RANK", "_MAX_TENSOR_RANK", _lowering_component._MAX_TENSOR_RANK),
+    ("_SV_INT_MAX", "_SV_INT_MAX", _lowering_component._SV_INT_MAX),
+    ("math", "math", math),
+    (
+        "SequenceABC",
+        "SequenceABC",
+        _lowering_component.SequenceABC,
+    ),
+    ("UnsupportedOpError", "UnsupportedOpError", UnsupportedOpError),
+    ("GraphIR", "GraphIR", GraphIR),
+    ("TensorIR", "TensorIR", TensorIR),
+    ("ArgmaxIR", "ArgmaxIR", ArgmaxIR),
+    ("Conv2dIR", "Conv2dIR", Conv2dIR),
+    ("FlattenIR", "FlattenIR", FlattenIR),
+    ("LinearIR", "LinearIR", LinearIR),
+    ("ReluIR", "ReluIR", ReluIR),
+)
+_STATE_GUARD_FUNCTION_BINDINGS = (
+    ("_state_framework_module_classes", "_state_framework_module_classes"),
+    ("_copy_model_for_tracing", "_copy_model_for_tracing"),
+    ("_validate_no_custom_copy_protocol", "_validate_no_custom_copy_protocol"),
+    ("_validate_no_custom_class_state", "_validate_no_custom_class_state"),
+    ("_validate_copy_safe_instance_state", "_validate_copy_safe_instance_state"),
+    ("_is_copy_safe_state_value", "_is_copy_safe_state_value"),
+    ("_snapshot_module_class_definitions", "_snapshot_module_class_definitions"),
+    ("_restore_module_class_definitions", "_restore_module_class_definitions"),
+    ("_raw_module_state", "_raw_module_state"),
+    ("_trusted_named_modules", "_trusted_named_modules"),
+    ("_trusted_named_tensors", "_trusted_named_tensors"),
+    ("_snapshot_module_state", "_snapshot_module_state"),
+    ("_freeze_state_value", "_freeze_state_value"),
+)
+_PROTECTED_STATE_GUARD_FUNCTION_STATES = tuple(
+    (
+        source_name,
+        consumer_name,
+        _capture_function_integrity_state(
+            _TRUSTED_STATE_GUARD_GLOBALS[source_name]
+        ),
+    )
+    for source_name, consumer_name in _STATE_GUARD_FUNCTION_BINDINGS
+)
+_PROTECTED_STATE_GUARD_BINDINGS = (
+    ("copy", "copy", copy),
+    (
+        "OrderedDict",
+        "OrderedDict",
+        _state_guard_component.OrderedDict,
+    ),
+    ("FunctionType", "FunctionType", FunctionType),
+    ("np", "np", np),
+    ("UnsupportedOpError", "UnsupportedOpError", UnsupportedOpError),
+)
+_FUSION_FUNCTION_BINDINGS = (
+    ("_fusion_require_exact_string_dict", "_fusion_require_exact_string_dict"),
+    ("_fusion_raw_static_attribute", "_fusion_raw_static_attribute"),
+    ("_fusion_is_fx_node", "_fusion_is_fx_node"),
+    ("_fusion_required_module_attribute", "_fusion_required_module_attribute"),
+    ("_fusion_positive_module_integer", "_fusion_positive_module_integer"),
+    ("_fusion_required_parameter", "_fusion_required_parameter"),
+    ("_fusion_optional_parameter", "_fusion_optional_parameter"),
+    ("_fuse_conv_batchnorm_eval", "_fuse_conv_batchnorm_eval"),
+    ("_validate_conv_batchnorm_pair", "_validate_conv_batchnorm_pair"),
+    ("_require_eval_module", "_require_eval_module"),
+    ("_validate_fused_conv", "_validate_fused_conv"),
+    ("_tensor_values_are_finite", "_tensor_values_are_finite"),
+    ("_fresh_fused_target", "_fresh_fused_target"),
+    ("_fx_node_use_count", "_fx_node_use_count"),
+    ("_fx_value_reference_count", "_fx_value_reference_count"),
+)
+_PROTECTED_FUSION_FUNCTION_STATES = tuple(
+    (
+        source_name,
+        consumer_name,
+        _capture_function_integrity_state(
+            _TRUSTED_FUSION_GLOBALS[source_name]
+        ),
+    )
+    for source_name, consumer_name in _FUSION_FUNCTION_BINDINGS
+)
+_PROTECTED_FUSION_BINDINGS = (
+    ("math", "math", math),
+    ("np", "np", np),
+    ("FunctionType", "FunctionType", FunctionType),
+    ("UnsupportedOpError", "UnsupportedOpError", UnsupportedOpError),
+    (
+        "_raw_module_state",
+        "_raw_module_state",
+        _state_guard_component._raw_module_state,
+    ),
+    (
+        "_trusted_named_modules",
+        "_trusted_named_modules",
+        _state_guard_component._trusted_named_modules,
+    ),
+)
+_SEMANTICS_FUNCTION_BINDINGS = (
+    ("_run_concrete_probe", "_run_concrete_probe"),
+    ("_validate_fusion_boundary", "_validate_fusion_boundary"),
+    ("_validate_lowered_semantics", "_validate_lowered_semantics"),
+)
+_PROTECTED_SEMANTICS_FUNCTION_STATES = tuple(
+    (
+        source_name,
+        consumer_name,
+        _capture_function_integrity_state(
+            _TRUSTED_SEMANTICS_GLOBALS[source_name]
+        ),
+    )
+    for source_name, consumer_name in _SEMANTICS_FUNCTION_BINDINGS
+)
+_PROTECTED_SEMANTICS_BINDINGS = (
+    ("math", "math", math),
+    ("np", "np", np),
+    ("_quant_reference", "_quant_reference", _quant_reference),
+    (
+        "_INFER_FLOAT_GRAPH",
+        "_INFER_FLOAT_GRAPH",
+        _TRUSTED_INFER_FLOAT_GRAPH,
+    ),
+    ("UnsupportedOpError", "UnsupportedOpError", UnsupportedOpError),
+    ("GraphIR", "GraphIR", GraphIR),
+    (
+        "_copy_model_for_tracing",
+        "_copy_model_for_tracing",
+        _state_guard_component._copy_model_for_tracing,
+    ),
+    (
+        "_restore_module_class_definitions",
+        "_restore_module_class_definitions",
+        _state_guard_component._restore_module_class_definitions,
+    ),
+    (
+        "_snapshot_module_class_definitions",
+        "_snapshot_module_class_definitions",
+        _state_guard_component._snapshot_module_class_definitions,
+    ),
+    (
+        "_snapshot_module_state",
+        "_snapshot_module_state",
+        _state_guard_component._snapshot_module_state,
+    ),
+)
+_MODEL_CONTRACT_FUNCTION_BINDINGS = (
+    ("_contract_require_exact_string_dict", "_contract_require_exact_string_dict"),
+    ("_contract_raw_static_attribute", "_contract_raw_static_attribute"),
+    ("_validate_model_semantics", "_validate_model_semantics"),
+    ("_validate_module_dispatch", "_validate_module_dispatch"),
+    ("_validate_no_custom_introspection", "_validate_no_custom_introspection"),
+    ("_validate_forward_python_state", "_validate_forward_python_state"),
+    (
+        "_validate_reachable_python_function",
+        "_validate_reachable_python_function",
+    ),
+    ("_find_custom_method", "_find_custom_method"),
+    ("_next_loaded_attribute", "_next_loaded_attribute"),
+    ("_is_immutable_python_state", "_is_immutable_python_state"),
+    ("_contains_code_object", "_contains_code_object"),
+    ("_normalize_float_dtype", "_normalize_float_dtype"),
+)
+_PROTECTED_MODEL_CONTRACT_FUNCTION_STATES = tuple(
+    (
+        source_name,
+        consumer_name,
+        _capture_function_integrity_state(
+            _TRUSTED_MODEL_CONTRACT_GLOBALS[source_name]
+        ),
+    )
+    for source_name, consumer_name in _MODEL_CONTRACT_FUNCTION_BINDINGS
+)
+_PROTECTED_MODEL_CONTRACT_BINDINGS = (
+    ("builtins", "builtins", builtins),
+    ("dis", "dis", dis),
+    ("np", "np", np),
+    ("CodeType", "CodeType", CodeType),
+    ("FunctionType", "FunctionType", FunctionType),
+    ("_BUILTINS", "_BUILTINS", _TRUSTED_BUILTINS),
+    ("_LEN", "_LEN", _TRUSTED_LEN),
+    ("_DIS_BYTECODE", "_DIS_BYTECODE", _TRUSTED_DIS_BYTECODE),
+    ("_DIS_HASJABS", "_DIS_HASJABS", _TRUSTED_DIS_HASJABS),
+    ("_DIS_HASJREL", "_DIS_HASJREL", _TRUSTED_DIS_HASJREL),
+    ("UnsupportedOpError", "UnsupportedOpError", UnsupportedOpError),
+    (
+        "_raw_module_state",
+        "_raw_module_state",
+        _state_guard_component._raw_module_state,
+    ),
+    (
+        "_state_framework_module_classes",
+        "_state_framework_module_classes",
+        _state_guard_component._state_framework_module_classes,
+    ),
+    (
+        "_trusted_named_modules",
+        "_trusted_named_modules",
+        _state_guard_component._trusted_named_modules,
+    ),
+    (
+        "_trusted_named_tensors",
+        "_trusted_named_tensors",
+        _state_guard_component._trusted_named_tensors,
+    ),
+    (
+        "_validate_copy_safe_instance_state",
+        "_validate_copy_safe_instance_state",
+        _state_guard_component._validate_copy_safe_instance_state,
+    ),
+    (
+        "_validate_no_custom_class_state",
+        "_validate_no_custom_class_state",
+        _state_guard_component._validate_no_custom_class_state,
+    ),
+    (
+        "_validate_no_custom_copy_protocol",
+        "_validate_no_custom_copy_protocol",
+        _state_guard_component._validate_no_custom_copy_protocol,
+    ),
+)
+_PIPELINE_FUNCTION_BINDINGS = (("_parse_model_impl", "_parse_model_impl"),)
+_PROTECTED_PIPELINE_FUNCTION_STATES = tuple(
+    (
+        source_name,
+        consumer_name,
+        _capture_function_integrity_state(
+            _TRUSTED_PIPELINE_GLOBALS[source_name]
+        ),
+    )
+    for source_name, consumer_name in _PIPELINE_FUNCTION_BINDINGS
+)
+_PROTECTED_PIPELINE_BINDINGS = (
+    ("UnsupportedOpError", "UnsupportedOpError", UnsupportedOpError),
+    ("GraphIR", "GraphIR", GraphIR),
+    (
+        "_validate_input_shape",
+        "_validate_input_shape",
+        _lowering_component._validate_input_shape,
+    ),
+    (
+        "_validate_model_semantics",
+        "_validate_model_semantics",
+        _model_contract_component._validate_model_semantics,
+    ),
+    (
+        "_copy_model_for_tracing",
+        "_copy_model_for_tracing",
+        _state_guard_component._copy_model_for_tracing,
+    ),
+    (
+        "_snapshot_module_state",
+        "_snapshot_module_state",
+        _state_guard_component._snapshot_module_state,
+    ),
+    (
+        "_snapshot_module_class_definitions",
+        "_snapshot_module_class_definitions",
+        _state_guard_component._snapshot_module_class_definitions,
+    ),
+    (
+        "_restore_module_class_definitions",
+        "_restore_module_class_definitions",
+        _state_guard_component._restore_module_class_definitions,
+    ),
+    (
+        "_fuse_conv_batchnorm_eval",
+        "_fuse_conv_batchnorm_eval",
+        _fusion_component._fuse_conv_batchnorm_eval,
+    ),
+    (
+        "_trusted_named_modules",
+        "_trusted_named_modules",
+        _state_guard_component._trusted_named_modules,
+    ),
+    ("lower_fx_graph", "lower_fx_graph", _lowering_component.lower_fx_graph),
+    (
+        "_validate_fusion_boundary",
+        "_validate_fusion_boundary",
+        _semantics_component._validate_fusion_boundary,
+    ),
+    (
+        "_validate_lowered_semantics",
+        "_validate_lowered_semantics",
+        _semantics_component._validate_lowered_semantics,
+    ),
+)
+_PROTECTED_PIPELINE_FACADE_FUNCTION_STATES = (
+    (
+        "_parse_model_impl",
+        "_parse_model_impl",
+        _capture_function_integrity_state(
+            _TRUSTED_PIPELINE_GLOBALS["_parse_model_impl"]
+        ),
+    ),
+)
+_PROTECTED_IR_CLASS_STATES = tuple(
+    (cls.__name__, cls, _class_local_fingerprint(cls))
+    for cls in (
+        GraphIR,
+        TensorIR,
+        ArgmaxIR,
+        Conv2dIR,
+        FlattenIR,
+        LinearIR,
+        ReluIR,
+        UnsupportedOpError,
+        _PostCallbackIntegrityError,
+    )
+)
+
+# Authored component descriptors. Definition-site dependencies are checked in
+# their real namespaces; only actual facade consumers receive facade entries.
+_COMPONENT_ATTESTATION_MANIFEST = (
+    (
+        "frontend_core",
+        _TRUSTED_FRONTEND_MODULE,
+        _TRUSTED_FRONTEND_GLOBALS,
+        _TRUSTED_FRONTEND_GLOBALS,
+        tuple(
+            (name, name, value)
+            for name, value in _PROTECTED_FRONTEND_BINDINGS
+        ),
+        tuple(
+            (name, name, state)
+            for name, state in _PROTECTED_FRONTEND_FUNCTION_STATES
+        ),
+    ),
+    (
+        "errors",
+        _TRUSTED_ERRORS_MODULE,
+        _TRUSTED_ERRORS_GLOBALS,
+        _TRUSTED_FRONTEND_GLOBALS,
+        (("UnsupportedOpError", "UnsupportedOpError", UnsupportedOpError),),
+        (),
+    ),
+    (
+        "lowering",
+        _TRUSTED_LOWERING_MODULE,
+        _TRUSTED_LOWERING_GLOBALS,
+        _TRUSTED_LOWERING_GLOBALS,
+        _PROTECTED_LOWERING_BINDINGS,
+        _PROTECTED_LOWERING_FUNCTION_STATES,
+    ),
+    (
+        "state_guard",
+        _TRUSTED_STATE_GUARD_MODULE,
+        _TRUSTED_STATE_GUARD_GLOBALS,
+        _TRUSTED_STATE_GUARD_GLOBALS,
+        _PROTECTED_STATE_GUARD_BINDINGS,
+        _PROTECTED_STATE_GUARD_FUNCTION_STATES,
+    ),
+    (
+        "fusion",
+        _TRUSTED_FUSION_MODULE,
+        _TRUSTED_FUSION_GLOBALS,
+        _TRUSTED_FUSION_GLOBALS,
+        _PROTECTED_FUSION_BINDINGS,
+        _PROTECTED_FUSION_FUNCTION_STATES,
+    ),
+    (
+        "semantics",
+        _TRUSTED_SEMANTICS_MODULE,
+        _TRUSTED_SEMANTICS_GLOBALS,
+        _TRUSTED_SEMANTICS_GLOBALS,
+        _PROTECTED_SEMANTICS_BINDINGS,
+        _PROTECTED_SEMANTICS_FUNCTION_STATES,
+    ),
+    (
+        "model_contract",
+        _TRUSTED_MODEL_CONTRACT_MODULE,
+        _TRUSTED_MODEL_CONTRACT_GLOBALS,
+        _TRUSTED_MODEL_CONTRACT_GLOBALS,
+        _PROTECTED_MODEL_CONTRACT_BINDINGS,
+        _PROTECTED_MODEL_CONTRACT_FUNCTION_STATES,
+    ),
+    (
+        "pipeline",
+        _TRUSTED_PIPELINE_MODULE,
+        _TRUSTED_PIPELINE_GLOBALS,
+        _TRUSTED_PIPELINE_GLOBALS,
+        _PROTECTED_PIPELINE_BINDINGS,
+        _PROTECTED_PIPELINE_FUNCTION_STATES,
+    ),
+    (
+        "pipeline_facade",
+        _TRUSTED_PIPELINE_MODULE,
+        _TRUSTED_PIPELINE_GLOBALS,
+        _TRUSTED_FRONTEND_GLOBALS,
+        (),
+        _PROTECTED_PIPELINE_FACADE_FUNCTION_STATES,
+    ),
+)
+
+_PROTECTED_QUANT_BINDINGS = (
+    ("infer_float_graph", _TRUSTED_INFER_FLOAT_GRAPH),
+    ("_conv2d_float", _quant_reference._conv2d_float),
+    ("_graph_float_dtype", _quant_reference._graph_float_dtype),
+    ("_FUNCTIONAL_LINEAR", _quant_reference._FUNCTIONAL_LINEAR),
+    ("_FUNCTIONAL_CONV2D", _quant_reference._FUNCTIONAL_CONV2D),
+    ("_FUNCTIONAL_RELU", _quant_reference._FUNCTIONAL_RELU),
+    ("GraphIR", _quant_reference.GraphIR),
+    ("LinearIR", _quant_reference.LinearIR),
+    ("Conv2dIR", _quant_reference.Conv2dIR),
+    ("ReluIR", _quant_reference.ReluIR),
+    ("FlattenIR", _quant_reference.FlattenIR),
+    ("ArgmaxIR", _quant_reference.ArgmaxIR),
+    ("FloatReferenceResult", _quant_reference.FloatReferenceResult),
+    ("ActivationResult", _quant_reference.ActivationResult),
+    ("np", _quant_reference.np),
+)
+_PROTECTED_QUANT_FUNCTION_STATES = tuple(
+    (name, _capture_function_integrity_state(_TRUSTED_QUANT_REFERENCE_GLOBALS[name]))
+    for name in ("infer_float_graph", "_conv2d_float", "_graph_float_dtype")
+)
+_PROTECTED_QUANT_CLASS_STATES = tuple(
+    (cls.__name__, cls, _class_local_fingerprint(cls))
+    for cls in (
+        _quant_reference.FloatReferenceResult,
+        _quant_reference.ActivationResult,
+    )
+)
+
+_EXPLICIT_TRUSTED_GLOBAL_NAMES = (
+    "_COMPONENT_ATTESTATION_MANIFEST",
+    "_TRUSTED_BOOTSTRAP_GLOBAL_BINDINGS",
+    "_TRUSTED_BUILTINS",
+    "_TRUSTED_BUILTINS_MODULE",
+    "_TRUSTED_BUILTIN_BINDINGS",
+    "_TRUSTED_CODE_TYPE",
+    "_TRUSTED_COPY_DEEPCOPY_GLOBALS",
+    "_TRUSTED_COPY_DISPATCH_TABLE",
+    "_TRUSTED_COPY_DISPATCH_TABLE_FUNCTIONS",
+    "_TRUSTED_COPY_DISPATCH_TABLE_ITEMS",
+    "_TRUSTED_COPY_MODULE",
+    "_TRUSTED_DEEPCOPY",
+    "_TRUSTED_DEEPCOPY_CODE",
+    "_TRUSTED_DEEPCOPY_DISPATCH",
+    "_TRUSTED_DEEPCOPY_DISPATCH_FUNCTIONS",
+    "_TRUSTED_DEEPCOPY_DISPATCH_ITEMS",
+    "_TRUSTED_DEEPCOPY_LOCAL_STATE",
+    "_TRUSTED_DICT_TYPE",
+    "_TRUSTED_DIS_BYTECODE",
+    "_TRUSTED_DIS_BYTECODE_METHODS",
+    "_TRUSTED_DIS_CALLABLE_BINDINGS",
+    "_TRUSTED_DIS_CLASS_STATES",
+    "_TRUSTED_DIS_HASJABS",
+    "_TRUSTED_DIS_HASJABS_CONTENTS",
+    "_TRUSTED_DIS_HASJREL",
+    "_TRUSTED_DIS_HASJREL_CONTENTS",
+    "_TRUSTED_DIS_MODULE",
+    "_TRUSTED_DIS_NAMEDTUPLE_GLOBALS",
+    "_TRUSTED_DIS_RUNTIME_STATE",
+    "_TRUSTED_EMPTY_CELL",
+    "_TRUSTED_ERRORS_GLOBALS",
+    "_TRUSTED_ERRORS_MODULE",
+    "_TRUSTED_FRAMEWORK_CLASSES",
+    "_TRUSTED_FRAMEWORK_DEFINITIONS",
+    "_TRUSTED_FRAMEWORK_TYPES",
+    "_TRUSTED_FRONTEND_GLOBALS",
+    "_TRUSTED_FRONTEND_MODULE",
+    "_TRUSTED_FUSION_GLOBALS",
+    "_TRUSTED_FUSION_MODULE",
+    "_TRUSTED_FUNCTION_BINDINGS",
+    "_TRUSTED_FUNCTION_FINGERPRINTS",
+    "_TRUSTED_FUNCTION_TYPE",
+    "_TRUSTED_FX_CLASSES",
+    "_TRUSTED_INFER_FLOAT_GRAPH",
+    "_TRUSTED_INSPECT_GETATTR_STATIC",
+    "_TRUSTED_INSPECT_MODULE",
+    "_TRUSTED_INSPECT_UNWRAP",
+    "_TRUSTED_INTEGRITY_HELPER_BINDINGS",
+    "_TRUSTED_IS_GRAD_ENABLED",
+    "_TRUSTED_LEN",
+    "_TRUSTED_LOWERING_GLOBALS",
+    "_TRUSTED_LOWERING_MODULE",
+    "_TRUSTED_MATH_ISFINITE",
+    "_TRUSTED_MATH_MODULE",
+    "_TRUSTED_MATH_PROD",
+    "_TRUSTED_MODULE_GETATTRIBUTE",
+    "_TRUSTED_MODULE_TYPE",
+    "_TRUSTED_MODEL_CONTRACT_GLOBALS",
+    "_TRUSTED_MODEL_CONTRACT_MODULE",
+    "_TRUSTED_NUMPY_BINDINGS",
+    "_TRUSTED_NUMPY_MODULE",
+    "_TRUSTED_PARAMETER_TYPE",
+    "_TRUSTED_PIPELINE_GLOBALS",
+    "_TRUSTED_PIPELINE_MODULE",
+    "_TRUSTED_QUANT_REFERENCE_GLOBALS",
+    "_TRUSTED_QUANT_REFERENCE_MODULE",
+    "_TRUSTED_RUNTIME_MODULES",
+    "_TRUSTED_SEMANTICS_GLOBALS",
+    "_TRUSTED_SEMANTICS_MODULE",
+    "_TRUSTED_SET_GRAD_ENABLED",
+    "_TRUSTED_STATE_GUARD_GLOBALS",
+    "_TRUSTED_STATE_GUARD_MODULE",
+    "_TRUSTED_STR_TYPE",
+    "_TRUSTED_SYS_BYTEORDER",
+    "_TRUSTED_SYS_GETRECURSIONLIMIT",
+    "_TRUSTED_SYS_MODULE",
+    "_TRUSTED_SYS_MODULES",
+    "_TRUSTED_TENSOR_COPY_BINDINGS",
+    "_TRUSTED_TORCH_MODULE",
+    "_TRUSTED_TORCH_C_MODULE",
+    "_TRUSTED_TORCH_NN_MODULE",
+    "_TRUSTED_TYPE",
+    "_TRUSTED_TYPE_GETATTRIBUTE",
+    "_TRUSTED_UNSUPPORTED_OP_ERROR",
+)
+_EXPLICIT_TRUSTED_GLOBAL_BINDINGS = tuple(
+    (name, _TRUSTED_FRONTEND_GLOBALS[name])
+    for name in _EXPLICIT_TRUSTED_GLOBAL_NAMES
+)
+
+_validate_framework_integrity = _make_integrity_validator(
+    _validate_framework_integrity_impl,
+    _parse_model_impl,
+    _TRUSTED_FRONTEND_GLOBALS,
+    _TRUSTED_TYPE,
+    _TRUSTED_STR_TYPE,
+    _TRUSTED_UNSUPPORTED_OP_ERROR,
+    _EXPLICIT_TRUSTED_GLOBAL_BINDINGS,
+    _PROTECTED_FRONTEND_BINDINGS,
+    _PROTECTED_FRONTEND_FUNCTION_STATES,
+    _PROTECTED_IR_CLASS_STATES,
+    _COMPONENT_ATTESTATION_MANIFEST,
+    (UnsupportedOpError, _PostCallbackIntegrityError),
+    _TRUSTED_QUANT_REFERENCE_MODULE,
+    _TRUSTED_QUANT_REFERENCE_GLOBALS,
+    _PROTECTED_QUANT_BINDINGS,
+    _PROTECTED_QUANT_FUNCTION_STATES,
+    _PROTECTED_QUANT_CLASS_STATES,
+    _function_integrity_state_matches,
+    _function_integrity_state_matches.__code__,
+    _TRUSTED_FUNCTION_TYPE,
+    _TRUSTED_DICT_TYPE,
+    _TRUSTED_LEN,
+    ValueError,
+    _TRUSTED_EMPTY_CELL,
+    _TRUSTED_MODULE_TYPE,
+    _TRUSTED_MODULE_GETATTRIBUTE,
+    _TRUSTED_TYPE_GETATTRIBUTE,
+)
+_TRUSTED_VALIDATE_FRAMEWORK_INTEGRITY = _validate_framework_integrity
+
+_VALIDATOR_INTEGRITY_STATE = _capture_function_integrity_state(
+    _validate_framework_integrity
+)
+_TRUSTED_CALLBACK_SECURITY_CONTEXT = (
+    _validate_framework_integrity,
+    _VALIDATOR_INTEGRITY_STATE,
+    _function_integrity_state_matches,
+    _function_integrity_state_matches.__code__,
+    _TRUSTED_TYPE,
+    _TRUSTED_FUNCTION_TYPE,
+    _TRUSTED_DICT_TYPE,
+    _TRUSTED_STR_TYPE,
+    _TRUSTED_LEN,
+    ValueError,
+    _TRUSTED_EMPTY_CELL,
+    _TRUSTED_UNSUPPORTED_OP_ERROR,
+    BaseException,
+    _PostCallbackIntegrityError,
+    _TRUSTED_IS_GRAD_ENABLED,
+    _TRUSTED_SET_GRAD_ENABLED,
+)
+
+_PUBLIC_PARSE_ERRORS = (
+    _TRUSTED_UNSUPPORTED_OP_ERROR(
+        "Unsupported modified frontend parser closure roots"
+    ),
+    _TRUSTED_UNSUPPORTED_OP_ERROR("Unsupported modified frontend parser closure"),
+    _TRUSTED_UNSUPPORTED_OP_ERROR("Unsupported modified frontend runtime keys"),
+    _TRUSTED_UNSUPPORTED_OP_ERROR("Unsupported modified frontend parser binding"),
+    _TRUSTED_UNSUPPORTED_OP_ERROR(
+        "Unsupported modified frontend parser implementation"
+    ),
+    _TRUSTED_UNSUPPORTED_OP_ERROR(
+        "Unsupported modified frontend integrity validator"
+    ),
+    _TRUSTED_UNSUPPORTED_OP_ERROR(
+        "Unsupported modified frontend trust root "
+        "_TRUSTED_CALLBACK_SECURITY_CONTEXT"
+    ),
+    _TRUSTED_UNSUPPORTED_OP_ERROR(
+        "Unsupported modified frontend integrity after untrusted callback"
+    ),
+)
+
+parse_model = _make_parse_model(
+    _parse_model_impl,
+    _validate_framework_integrity,
+    _TRUSTED_TORCH_MODULE,
+    _TRUSTED_TORCH_NN_MODULE,
+    _TRUSTED_FRONTEND_GLOBALS,
+    _TRUSTED_TYPE,
+    _TRUSTED_STR_TYPE,
+    _VALIDATOR_INTEGRITY_STATE,
+    _function_integrity_state_matches,
+    _function_integrity_state_matches.__code__,
+    _TRUSTED_FUNCTION_TYPE,
+    _TRUSTED_DICT_TYPE,
+    _TRUSTED_LEN,
+    ValueError,
+    _TRUSTED_EMPTY_CELL,
+    _TRUSTED_CALLBACK_SECURITY_CONTEXT,
+    _checked_untrusted_call,
+    _PostCallbackIntegrityError,
+    _PUBLIC_PARSE_ERRORS,
+)
+parse_model.__qualname__ = "parse_model"
