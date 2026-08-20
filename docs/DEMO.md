@@ -22,7 +22,16 @@ Conv2d -> ReLU -> Flatten -> Linear
 
 ## 3. Разбор через torch.fx
 
-Откройте `torch2rtl/frontend/pytorch_fx.py`. Функция `parse_model` вызывает `torch.fx.symbolic_trace`, проверяет одну последовательную цепочку реальных зависимостей и настоящий `output`. Поддержаны module-вызовы `Linear`, `ReLU`, полный `Flatten`, `Conv2d` и финальный глобальный `argmax`. Неподдержанный узел или семантика приводит к `UnsupportedOpError` до RTL.
+Откройте сначала `torch2rtl/frontend/pytorch_fx.py`: здесь находится стабильная
+публичная функция `parse_model`, загрузка модели и проверка согласованности
+compiler runtime. Затем покажите `torch2rtl/frontend/_pipeline.py`, где явно
+виден порядок стадий: model contract, controlled copy, `torch.fx.symbolic_trace`,
+fusion, GraphIR lowering и semantic probes. Их реализации находятся в
+`_model_contract.py`, `_state_guard.py`, `_fusion.py`, `_lowering.py` и
+`_semantics.py`. Поддержаны module-вызовы `Linear`, `ReLU`, полный `Flatten`,
+`Conv2d` и финальный глобальный `argmax`. Неподдержанный узел или семантика
+приводит к `UnsupportedOpError` до RTL. Подробная карта для разработчиков:
+[`docs/frontend_architecture.md`](frontend_architecture.md).
 
 Frontend поддерживает точную соседнюю пару
 `nn.Conv2d -> nn.BatchNorm2d`. Модель уже должна находиться в режиме `eval`.

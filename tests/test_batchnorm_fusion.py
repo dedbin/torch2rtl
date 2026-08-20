@@ -572,7 +572,38 @@ def test_fused_target_does_not_collide_with_user_module_name() -> None:
     assert record["fused_target"].startswith("_torch2rtl_fused_conv_bn_0")
 
 
-def test_fixed_seed_randomized_differential_sweep() -> None:
+_BATCHNORM_SWEEP_AXES = tuple(
+    (dtype, pair_count, first_conv_bias)
+    for dtype in (torch.float32, torch.float64)
+    for pair_count in (1, 2)
+    for first_conv_bias in (False, True)
+)
+_BATCHNORM_SWEEP_CASES = tuple(
+    pytest.param(
+        variant_index,
+        axis_index,
+        id=(
+            f"stats-{variant_index}-"
+            f"{str(dtype).removeprefix('torch.')}-"
+            f"pairs-{pair_count}-"
+            f"conv-{'bias' if first_conv_bias else 'no-bias'}"
+        ),
+    )
+    for variant_index in range(4)
+    for axis_index, (dtype, pair_count, first_conv_bias) in enumerate(
+        _BATCHNORM_SWEEP_AXES
+    )
+)
+
+
+@pytest.mark.parametrize(
+    "variant_index,axis_index",
+    _BATCHNORM_SWEEP_CASES,
+)
+def test_fixed_seed_randomized_differential_sweep(
+    variant_index: int,
+    axis_index: int,
+) -> None:
     modes = ["affine-bias", "no-affine"]
     if _BATCHNORM_SUPPORTS_BIAS:
         modes.insert(1, "affine-no-bias")
@@ -628,140 +659,129 @@ def test_fixed_seed_randomized_differential_sweep() -> None:
             if batchnorm.bias is not None:
                 batchnorm.bias.uniform_(-0.5, 0.5)
 
-    axis_product = tuple(
-        (dtype, pair_count, first_conv_bias)
-        for dtype in (torch.float32, torch.float64)
-        for pair_count in (1, 2)
-        for first_conv_bias in (False, True)
+    dtype, pair_count, first_conv_bias = _BATCHNORM_SWEEP_AXES[axis_index]
+    case_index = variant_index * len(_BATCHNORM_SWEEP_AXES) + axis_index
+    torch.manual_seed(2026081800 + case_index)
+    mode = modes[(axis_index + variant_index) % len(modes)]
+    second_mode = modes[(axis_index + variant_index + 1) % len(modes)]
+    kernel, stride, padding, groups = conv_configs[
+        (axis_index + variant_index) % len(conv_configs)
+    ]
+    stats_case = variant_index
+    eps = eps_for_stats(stats_case)
+    input_channels = 1 + (axis_index + variant_index) % 3
+    middle_channels = 1 + (axis_index + 2 * variant_index) % 3
+    output_channels = 1 + (2 * axis_index + variant_index) % 3
+    first_conv = nn.Conv2d(
+        input_channels,
+        middle_channels,
+        kernel,
+        stride=stride,
+        padding=padding,
+        groups=groups,
+        bias=first_conv_bias,
+        dtype=dtype,
     )
-    for variant_index in range(4):
-        for axis_index, (
+    first_bn = new_batchnorm(middle_channels, mode, eps, dtype)
+    initialize_pair(first_conv, first_bn, stats_case)
+
+    if pair_count == 1:
+        model = nn.Sequential(first_conv, first_bn).eval()
+        official_convs = (
+            torch.nn.utils.fusion.fuse_conv_bn_eval(first_conv, first_bn),
+        )
+        official_model = nn.Sequential(*official_convs).eval()
+    else:
+        second_kernel = 1 if (axis_index + variant_index) % 2 else 3
+        second_padding = 0 if second_kernel == 1 else 1
+        second_conv = nn.Conv2d(
+            middle_channels,
+            output_channels,
+            second_kernel,
+            stride=1,
+            padding=second_padding,
+            groups=1,
+            bias=bool((axis_index + variant_index) % 2),
+            dtype=dtype,
+        )
+        second_stats_case = (stats_case + 1) % 4
+        second_bn = new_batchnorm(
+            output_channels,
+            second_mode,
+            eps_for_stats(second_stats_case),
             dtype,
-            pair_count,
-            first_conv_bias,
-        ) in enumerate(axis_product):
-            case_index = variant_index * len(axis_product) + axis_index
-            torch.manual_seed(2026081800 + case_index)
-            mode = modes[(axis_index + variant_index) % len(modes)]
-            second_mode = modes[(axis_index + variant_index + 1) % len(modes)]
-            kernel, stride, padding, groups = conv_configs[
-                (axis_index + variant_index) % len(conv_configs)
-            ]
-            stats_case = variant_index
-            eps = eps_for_stats(stats_case)
-            input_channels = 1 + (axis_index + variant_index) % 3
-            middle_channels = 1 + (axis_index + 2 * variant_index) % 3
-            output_channels = 1 + (2 * axis_index + variant_index) % 3
-            first_conv = nn.Conv2d(
-                input_channels,
-                middle_channels,
-                kernel,
-                stride=stride,
-                padding=padding,
-                groups=groups,
-                bias=first_conv_bias,
-                dtype=dtype,
-            )
-            first_bn = new_batchnorm(middle_channels, mode, eps, dtype)
-            initialize_pair(first_conv, first_bn, stats_case)
+        )
+        initialize_pair(second_conv, second_bn, second_stats_case)
+        model = nn.Sequential(
+            first_conv,
+            first_bn,
+            nn.ReLU(),
+            second_conv,
+            second_bn,
+        ).eval()
+        official_convs = (
+            torch.nn.utils.fusion.fuse_conv_bn_eval(first_conv, first_bn),
+            torch.nn.utils.fusion.fuse_conv_bn_eval(second_conv, second_bn),
+        )
+        official_model = nn.Sequential(
+            official_convs[0],
+            nn.ReLU(),
+            official_convs[1],
+        ).eval()
 
-            if pair_count == 1:
-                model = nn.Sequential(first_conv, first_bn).eval()
-                official_convs = (
-                    torch.nn.utils.fusion.fuse_conv_bn_eval(first_conv, first_bn),
-                )
-                official_model = nn.Sequential(*official_convs).eval()
-            else:
-                second_kernel = 1 if (axis_index + variant_index) % 2 else 3
-                second_padding = 0 if second_kernel == 1 else 1
-                second_conv = nn.Conv2d(
-                    middle_channels,
-                    output_channels,
-                    second_kernel,
-                    stride=1,
-                    padding=second_padding,
-                    groups=1,
-                    bias=bool((axis_index + variant_index) % 2),
-                    dtype=dtype,
-                )
-                second_stats_case = (stats_case + 1) % 4
-                second_bn = new_batchnorm(
-                    output_channels,
-                    second_mode,
-                    eps_for_stats(second_stats_case),
-                    dtype,
-                )
-                initialize_pair(second_conv, second_bn, second_stats_case)
-                model = nn.Sequential(
-                    first_conv,
-                    first_bn,
-                    nn.ReLU(),
-                    second_conv,
-                    second_bn,
-                ).eval()
-                official_convs = (
-                    torch.nn.utils.fusion.fuse_conv_bn_eval(first_conv, first_bn),
-                    torch.nn.utils.fusion.fuse_conv_bn_eval(second_conv, second_bn),
-                )
-                official_model = nn.Sequential(
-                    official_convs[0],
-                    nn.ReLU(),
-                    official_convs[1],
-                ).eval()
+    before = _source_snapshot(model)
+    inputs = torch.linspace(
+        -0.75,
+        0.75,
+        input_channels * 5 * 6,
+        dtype=dtype,
+    ).reshape(input_channels, 5, 6)
+    with torch.no_grad():
+        source = model(inputs.unsqueeze(0))[0]
+        official_output = official_model(inputs)
+    rtol, atol = (
+        (1e-5, 1e-6) if dtype is torch.float32 else (1e-12, 1e-12)
+    )
+    np.testing.assert_allclose(
+        source.detach().cpu().numpy(),
+        official_output.detach().cpu().numpy(),
+        rtol=rtol,
+        atol=atol,
+    )
+    assert int(torch.argmax(source)) == int(torch.argmax(official_output))
 
-            before = _source_snapshot(model)
-            inputs = torch.linspace(
-                -0.75,
-                0.75,
-                input_channels * 5 * 6,
-                dtype=dtype,
-            ).reshape(input_channels, 5, 6)
-            with torch.no_grad():
-                source = model(inputs.unsqueeze(0))[0]
-                official_output = official_model(inputs)
-            rtol, atol = (
-                (1e-5, 1e-6) if dtype is torch.float32 else (1e-12, 1e-12)
-            )
-            np.testing.assert_allclose(
-                source.detach().cpu().numpy(),
-                official_output.detach().cpu().numpy(),
-                rtol=rtol,
-                atol=atol,
-            )
-            assert int(torch.argmax(source)) == int(torch.argmax(official_output))
+    graph = parse_model(
+        model,
+        input_shape=tuple(inputs.shape),
+        input_dtype=dtype,
+    )
 
-            graph = parse_model(
-                model,
-                input_shape=tuple(inputs.shape),
-                input_dtype=dtype,
-            )
-
-            assert _source_snapshot(model) == before
-            fused_convs = [op for op in graph.ops if isinstance(op, Conv2dIR)]
-            assert len(fused_convs) == len(official_convs)
-            assert len(graph.metadata["transformations"]) == len(official_convs)
-            for fused_conv, official_conv in zip(
-                fused_convs,
-                official_convs,
-                strict=True,
-            ):
-                np.testing.assert_array_equal(
-                    fused_conv.weight,
-                    official_conv.weight.detach().cpu().numpy(),
-                )
-                assert official_conv.bias is not None
-                np.testing.assert_array_equal(
-                    fused_conv.bias,
-                    official_conv.bias.detach().cpu().numpy(),
-                )
-            result = infer_float_graph(graph, inputs.cpu().numpy())
-            np.testing.assert_allclose(
-                result.output,
-                source.detach().cpu().numpy(),
-                rtol=rtol,
-                atol=atol,
-            )
-            assert result.class_id == int(torch.argmax(source))
+    assert _source_snapshot(model) == before
+    fused_convs = [op for op in graph.ops if isinstance(op, Conv2dIR)]
+    assert len(fused_convs) == len(official_convs)
+    assert len(graph.metadata["transformations"]) == len(official_convs)
+    for fused_conv, official_conv in zip(
+        fused_convs,
+        official_convs,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(
+            fused_conv.weight,
+            official_conv.weight.detach().cpu().numpy(),
+        )
+        assert official_conv.bias is not None
+        np.testing.assert_array_equal(
+            fused_conv.bias,
+            official_conv.bias.detach().cpu().numpy(),
+        )
+    result = infer_float_graph(graph, inputs.cpu().numpy())
+    np.testing.assert_allclose(
+        result.output,
+        source.detach().cpu().numpy(),
+        rtol=rtol,
+        atol=atol,
+    )
+    assert result.class_id == int(torch.argmax(source))
 
 
 def test_model_without_batchnorm_keeps_old_graph_and_metadata_contract(

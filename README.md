@@ -40,6 +40,9 @@ flowchart LR
 Поддерживается MVP `v0.2 Semantic Correctness`. Точный контракт форм, FX-графа,
 выхода и fixed-point арифметики описан в
 [`docs/v0.2_semantic_correctness.md`](docs/v0.2_semantic_correctness.md).
+Разработчикам, которые меняют frontend, полезно также прочитать
+[`docs/frontend_architecture.md`](docs/frontend_architecture.md): там зафиксированы
+границы компонентов, порядок pipeline и maintainability guardrails.
 
 | Возможность | Статус |
 | --- | --- |
@@ -274,9 +277,9 @@ contract metadata, канонический testbench и локальные SHA-
 обязательную metadata. Произвольное допустимое изменение vector payload, не
 меняющее результат, или несвязанного report-поля обнаруживать не гарантируется.
 Manifest находится в том же build directory и не является внешним корнем
-доверия: согласованная злонамеренная замена RTL, vectors, report и их хешей
-одновременно находится вне threat model. Для такой защиты нужна внешняя подпись,
-доверенный manifest либо полная регенерация из доверенных исходников.
+доверия. Согласованная замена RTL, vectors, report и их хешей одновременно
+находится вне модели защиты текущих проверок. Для независимой проверки нужна
+внешняя подпись, доверенный manifest либо полная регенерация из исходников.
 
 ## Synthesis report
 
@@ -416,7 +419,14 @@ uv --cache-dir temp/uv-cache run torch2rtl visualize build --vector-index 0
 
 ```text
 torch2rtl/
-  frontend/pytorch_fx.py        # PyTorch -> torch.fx -> GraphIR
+  frontend/pytorch_fx.py        # public API, loader, runtime consistency, manifest
+  frontend/_pipeline.py         # фиксированный порядок стадий frontend
+  frontend/_model_contract.py   # допустимое подмножество PyTorch-моделей
+  frontend/_state_guard.py      # controlled copy и проверки состояния
+  frontend/_fusion.py           # Conv2d -> BatchNorm2d fusion
+  frontend/_lowering.py         # torch.fx -> GraphIR
+  frontend/_semantics.py        # semantic probes Boundary A/B
+  frontend/_errors.py           # общий UnsupportedOpError
   ir/                           # dataclass-IR для tensors, ops и graph
   quant/fixed_point.py          # fixed-point config и saturation helpers
   quant/reference.py            # fixed reference + dtype-faithful PyTorch float reference
@@ -435,6 +445,11 @@ examples/
 Внутренний принцип простой: сначала получить маленький и понятный `GraphIR`,
 потом уже генерировать артефакты. Поэтому проект удобно читать, отлаживать и
 расширять по одному оператору.
+
+Публичная функция `parse_model` находится в `pytorch_fx.py`. Её wrapper проверяет
+согласованность compiler runtime и передаёт работу в `_pipeline.py`; model
+contract, controlled copy/state, fusion, lowering и semantic probes реализованы
+в перечисленных выше компонентах. Это разделение не меняет публичный API.
 
 ## Разработка
 
