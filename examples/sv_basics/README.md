@@ -1,6 +1,6 @@
 # SystemVerilog basics
 
-This directory contains the reproducible Week 2 RTL exercises used before
+This directory contains reproducible foundational RTL exercises used before
 building larger torch2rtl datapaths.
 
 The examples cover:
